@@ -8,7 +8,7 @@ setup(
         "diffusers",
         "tensorboard",
         "wandb",
-        "mani_skill"
+        # "mani_skill"
     ],
     description="A minimal setup for Diffusion Policy for ManiSkill",
     long_description=open("README.md").read(),

@@ -172,9 +172,13 @@ class SmallDemoDataset_DiffusionPolicy(Dataset):  # Load everything into memory
             )
             # to make the arm stay still, we pad the action with 0 in 'delta_pos' control mode
             # gripper action needs to be copied from the last action
+            self.use_last_action_pad = False
         else:
-            # NOTE for absolute joint pos control probably should pad with the final joint position action.
-            raise NotImplementedError(f"Control Mode {args.control_mode} not supported")
+            # For absolute joint pos control (e.g. pd_joint_pos), repeat the last action
+            # so that the robot holds its final position
+            print(f"Detected absolute controller type ({args.control_mode}), padding with last action to hold position.")
+            self.pad_action_arm = None
+            self.use_last_action_pad = True
         self.obs_horizon, self.pred_horizon = obs_horizon, pred_horizon = (
             args.obs_horizon,
             args.pred_horizon,
@@ -226,9 +230,14 @@ class SmallDemoDataset_DiffusionPolicy(Dataset):  # Load everything into memory
         if start < 0:  # pad before the trajectory
             act_seq = torch.cat([act_seq[0].repeat(-start, 1), act_seq], dim=0)
         if end > L:  # pad after the trajectory
-            gripper_action = act_seq[-1, -1]  # assume gripper is with pos controller
-            pad_action = torch.cat((self.pad_action_arm, gripper_action[None]), dim=0)
-            act_seq = torch.cat([act_seq, pad_action.repeat(end - L, 1)], dim=0)
+            if self.use_last_action_pad:
+                # absolute control: hold the final joint positions
+                pad_action = act_seq[-1]
+            else:
+                # delta control: zero arm delta, copy gripper state
+                gripper_action = act_seq[-1, -1]
+                pad_action = torch.cat((self.pad_action_arm, gripper_action[None]), dim=0)
+            act_seq = torch.cat([act_seq, pad_action.unsqueeze(0).repeat(end - L, 1)], dim=0)
             # making the robot (arm and gripper) stay still
         assert (
             obs_seq["state"].shape[0] == self.obs_horizon
