@@ -49,6 +49,11 @@ def parse_args():
         default="base_camera,left_side_camera,right_side_camera",
         help="需要画框的相机名，用逗号分隔。",
     )
+    parser.add_argument(
+        "--skip-collision",
+        action="store_true",
+        help="跳过标记为碰撞的轨迹（需要 --meta-trim 中有 collision 字段）。",
+    )
     return parser.parse_args()
 
 
@@ -264,13 +269,19 @@ def main():
                 ep_idx = None
 
             trim_head = 0
+            collision = False
             if ep_idx is not None:
                 # save_record.py 中用的是整型 key 写入 meta（会在 json 里变成字符串）
                 key = str(ep_idx)
                 if key in trim_meta:
                     trim_head = int(trim_meta[key].get("trim_head_steps", 0))
+                    collision = bool(trim_meta[key].get("collision", False))
 
-            print(f"Processing {traj_id} (trim_head_steps={trim_head}) ...")
+            if args.skip_collision and collision:
+                print(f"Skipping {traj_id} (collision=True)")
+                continue
+
+            print(f"Processing {traj_id} (trim_head_steps={trim_head}, collision={collision}) ...")
             process_one_traj(
                 h5_file=h5_file,
                 traj_id=traj_id,
