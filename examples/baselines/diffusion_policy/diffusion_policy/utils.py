@@ -1,3 +1,4 @@
+import cv2
 import numpy as np
 import torch
 import torch.nn as nn
@@ -139,15 +140,32 @@ def load_demo_dataset(
     return dataset
 
 
-def convert_obs(obs, concat_fn, transpose_fn, state_obs_extractor, depth = True):
+def _resize_img_to(img: np.ndarray, target_h: int, target_w: int) -> np.ndarray:
+    """Resize a (H,W,C) or (T,H,W,C) uint8/float numpy array to (target_h, target_w, C)."""
+    if img.ndim == 3:  # (H, W, C)
+        if img.shape[0] == target_h and img.shape[1] == target_w:
+            return img
+        return cv2.resize(img, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
+    elif img.ndim == 4:  # (T, H, W, C)
+        if img.shape[1] == target_h and img.shape[2] == target_w:
+            return img
+        return np.stack(
+            [cv2.resize(f, (target_w, target_h), interpolation=cv2.INTER_LINEAR) for f in img]
+        )
+    return img
+
+
+def convert_obs(obs, concat_fn, transpose_fn, state_obs_extractor, depth=True, target_size=(128, 128)):
     img_dict = obs["sensor_data"]
     ls = ["rgb"]
     if depth:
         ls = ["rgb", "depth"]
 
+    target_h, target_w = target_size
+
     new_img_dict = {
         key: transpose_fn(
-            concat_fn([v[key] for v in img_dict.values()])
+            concat_fn([_resize_img_to(v[key], target_h, target_w) for v in img_dict.values()])
         )  # (C, H, W) or (B, C, H, W)
         for key in ls
     }

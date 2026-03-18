@@ -157,19 +157,6 @@ class SmallDemoDataset_DiffusionPolicy(Dataset):  # Load everything into memory
             trajectories["actions"][i] = torch.Tensor(trajectories["actions"][i]).to(
                 device=device
             )
-
-        # Normalize actions to [-1, 1] for diffusion compatibility.
-        # This is needed when using absolute controllers (e.g. pd_joint_pos) whose
-        # joint angles are not naturally bounded in [-1, 1].
-        all_acts = torch.cat(trajectories["actions"], dim=0)  # (total_T, act_dim)
-        self.action_min = all_acts.min(dim=0).values  # (act_dim,)
-        self.action_max = all_acts.max(dim=0).values  # (act_dim,)
-        act_range = (self.action_max - self.action_min).clamp(min=1e-8)
-        for i in range(len(trajectories["actions"])):
-            a = trajectories["actions"][i]
-            trajectories["actions"][i] = 2.0 * (a - self.action_min) / act_range - 1.0
-        print(f"Actions normalized to [-1, 1] using per-DoF min/max from training data.")
-
         print(
             "Obs/action pre-processing is done, start to pre-compute the slice indices..."
         )
@@ -180,20 +167,14 @@ class SmallDemoDataset_DiffusionPolicy(Dataset):  # Load everything into memory
             or args.control_mode == "base_pd_joint_vel_arm_pd_joint_vel"
         ):
             print("Detected a delta controller type, padding with a zero action to ensure the arm stays still after solving tasks.")
-            original_zero = torch.zeros(
+            self.pad_action_arm = torch.zeros(
                 (trajectories["actions"][0].shape[1] - 1,), device=device
             )
-            # Normalize the zero action to match the normalized action space
-            self.pad_action_arm = 2.0 * (original_zero - self.action_min[:-1]) / act_range[:-1] - 1.0
             # to make the arm stay still, we pad the action with 0 in 'delta_pos' control mode
             # gripper action needs to be copied from the last action
-            self.use_last_action_pad = False
         else:
-            # For absolute joint pos control (e.g. pd_joint_pos), repeat the last action
-            # so that the robot holds its final position
-            print(f"Detected absolute controller type ({args.control_mode}), padding with last action to hold position.")
-            self.pad_action_arm = None
-            self.use_last_action_pad = True
+            # NOTE for absolute joint pos control probably should pad with the final joint position action.
+            raise NotImplementedError(f"Control Mode {args.control_mode} not supported")
         self.obs_horizon, self.pred_horizon = obs_horizon, pred_horizon = (
             args.obs_horizon,
             args.pred_horizon,
@@ -245,14 +226,9 @@ class SmallDemoDataset_DiffusionPolicy(Dataset):  # Load everything into memory
         if start < 0:  # pad before the trajectory
             act_seq = torch.cat([act_seq[0].repeat(-start, 1), act_seq], dim=0)
         if end > L:  # pad after the trajectory
-            if self.use_last_action_pad:
-                # absolute control: hold the final joint positions
-                pad_action = act_seq[-1]
-            else:
-                # delta control: zero arm delta, copy gripper state
-                gripper_action = act_seq[-1, -1]
-                pad_action = torch.cat((self.pad_action_arm, gripper_action[None]), dim=0)
-            act_seq = torch.cat([act_seq, pad_action.unsqueeze(0).repeat(end - L, 1)], dim=0)
+            gripper_action = act_seq[-1, -1]  # assume gripper is with pos controller
+            pad_action = torch.cat((self.pad_action_arm, gripper_action[None]), dim=0)
+            act_seq = torch.cat([act_seq, pad_action.repeat(end - L, 1)], dim=0)
             # making the robot (arm and gripper) stay still
         assert (
             obs_seq["state"].shape[0] == self.obs_horizon
@@ -277,13 +253,11 @@ class Agent(nn.Module):
             len(env.single_observation_space["state"].shape) == 2
         )  # (obs_horizon, obs_dim)
         assert len(env.single_action_space.shape) == 1  # (act_dim, )
-        # Note: we normalize actions to [-1, 1] in the dataset so we do not require
-        # the env action space to be bounded in [-1, 1] here.
+        assert (env.single_action_space.high == 1).all() and (
+            env.single_action_space.low == -1
+        ).all()
+        # denoising results will be clipped to [-1,1], so the action should be in [-1,1] as well
         self.act_dim = env.single_action_space.shape[0]
-        # Buffers for action denormalization (set from dataset after construction)
-        self.register_buffer("action_min", torch.zeros(self.act_dim))
-        self.register_buffer("action_max", torch.ones(self.act_dim))
-        self.action_normed = True  # always normalize/denormalize
         obs_state_dim = env.single_observation_space["state"].shape[1]
         total_visual_channels = 0
         self.include_rgb = "rgb" in env.single_observation_space.keys()
@@ -404,12 +378,7 @@ class Agent(nn.Module):
         # only take act_horizon number of actions
         start = self.obs_horizon - 1
         end = start + self.act_horizon
-        actions = noisy_action_seq[:, start:end]  # (B, act_horizon, act_dim), normalized
-        if self.action_normed:
-            # denormalize from [-1, 1] back to original action space
-            act_range = (self.action_max - self.action_min).clamp(min=1e-8)
-            actions = (actions + 1.0) / 2.0 * act_range + self.action_min
-        return actions  # (B, act_horizon, act_dim)
+        return noisy_action_seq[:, start:end]  # (B, act_horizon, act_dim)
 
 
 def save_ckpt(run_name, tag):
@@ -459,15 +428,12 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
 
     # create evaluation environment
-    # sensor_configs resizes all cameras to 128×128 to avoid concat failures
-    # when cameras have different resolutions (e.g. hand_camera=128 vs base_camera=512)
     env_kwargs = dict(
         control_mode=args.control_mode,
         reward_mode="sparse",
         obs_mode=args.obs_mode,
         render_mode="rgb_array",
-        human_render_camera_configs=dict(shader_pack="default"),
-        sensor_configs=dict(width=128, height=128),
+        human_render_camera_configs=dict(shader_pack="default")
     )
     assert args.max_episode_steps != None, "max_episode_steps must be specified as imitation learning algorithms task solve speed is dependent on the data you train on"
     env_kwargs["max_episode_steps"] = args.max_episode_steps
@@ -542,9 +508,6 @@ if __name__ == "__main__":
     )
 
     agent = Agent(envs, args).to(device)
-    # Wire action normalization stats from the training dataset into the agent
-    agent.action_min.copy_(dataset.action_min)
-    agent.action_max.copy_(dataset.action_max)
 
     optimizer = optim.AdamW(
         params=agent.parameters(), lr=args.lr, betas=(0.95, 0.999), weight_decay=1e-6
@@ -563,9 +526,6 @@ if __name__ == "__main__":
     # holds a copy of the model weights
     ema = EMAModel(parameters=agent.parameters(), power=0.75)
     ema_agent = Agent(envs, args).to(device)
-    # Wire action normalization stats into ema_agent too (not copied by EMAModel)
-    ema_agent.action_min.copy_(dataset.action_min)
-    ema_agent.action_max.copy_(dataset.action_max)
 
     best_eval_metrics = defaultdict(float)
     timings = defaultdict(float)
