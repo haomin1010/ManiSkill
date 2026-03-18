@@ -4,6 +4,7 @@ import json
 import shutil
 
 import numpy as np
+from PIL import Image
 import gymnasium as gym
 import mani_skill.envs
 from mani_skill.utils.wrappers.record import RecordEpisode
@@ -76,6 +77,93 @@ def check_collision(init_positions, final_positions, threshold=0.01):
     return collision, displacements
 
 
+def project_world_to_pixel(world_point, intrinsic, extrinsic):
+    """将 3D 世界坐标投影到 2D 像素坐标"""
+    world_h = np.append(world_point, 1.0)
+    cam_h = extrinsic @ world_h
+    if cam_h[2] <= 0:
+        return None
+    uv_h = intrinsic @ cam_h[:3]
+    u = uv_h[0] / uv_h[2]
+    v = uv_h[1] / uv_h[2]
+    return (int(round(u)), int(round(v)))
+
+
+def save_initial_screenshots(env, ep_idx, output_dir, camera_names=None):
+    """
+    保存环境稳定后的初始截图和框中心点像素坐标。
+    
+    Args:
+        env: 环境对象
+        ep_idx: episode 索引
+        output_dir: 输出目录
+        camera_names: 要保存的相机名称列表
+    """
+    if camera_names is None:
+        camera_names = ["base_camera", "left_side_camera", "right_side_camera"]
+    
+    unwrapped = env.unwrapped
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # 获取 cubeA 的当前位置（初始位置）
+    cubeA_pos = np.asarray(unwrapped.cubeA.pose.p).flatten()[:3]
+    
+    # 获取目标位置（cubeB 顶部）
+    cubeB_pos = np.asarray(unwrapped.cubeB.pose.p).flatten()[:3]
+    cube_half_size = float(unwrapped.cube_half_size[0])
+    goal_pos = cubeB_pos.copy()
+    goal_pos[2] += cube_half_size * 2  # 在 cubeB 顶部
+    
+    # 获取最新的观测（包含相机图像）
+    obs = unwrapped.get_obs()
+    
+    result = {
+        "episode": ep_idx,
+        "cubeA_world_pos": cubeA_pos.tolist(),
+        "goal_world_pos": goal_pos.tolist(),
+        "cameras": {},
+    }
+    
+    for cam_name in camera_names:
+        if cam_name not in obs["sensor_data"]:
+            continue
+        
+        cam_data = obs["sensor_data"][cam_name]
+        
+        # 获取 RGB 图像
+        rgb = cam_data["rgb"][0].cpu().numpy()  # (H, W, 3)
+        if rgb.dtype != np.uint8:
+            rgb = (rgb * 255).astype(np.uint8) if rgb.max() <= 1.0 else rgb.astype(np.uint8)
+        
+        # 保存截图
+        img_path = output_dir / f"ep{ep_idx}_{cam_name}.png"
+        Image.fromarray(rgb).save(img_path)
+        
+        # 获取相机内参和外参
+        cam_params = obs["sensor_param"][cam_name]
+        intrinsic = cam_params["intrinsic_cv"][0].cpu().numpy()
+        extrinsic = cam_params["extrinsic_cv"][0].cpu().numpy()
+        
+        # 计算框中心点的像素坐标（框大小可以在后处理时决定）
+        init_center = project_world_to_pixel(cubeA_pos, intrinsic, extrinsic)
+        goal_center = project_world_to_pixel(goal_pos, intrinsic, extrinsic)
+        
+        result["cameras"][cam_name] = {
+            "image_path": str(img_path.name),
+            "init_center_px": list(init_center) if init_center else None,  # 初始位置框中心（红色）
+            "goal_center_px": list(goal_center) if goal_center else None,  # 目标位置框中心（蓝色）
+        }
+    
+    # 保存框位置信息
+    json_path = output_dir / f"ep{ep_idx}_boxes.json"
+    with json_path.open("w") as f:
+        json.dump(result, f, indent=2)
+    
+    print(f"  截图和框位置已保存到: {output_dir}")
+    return result
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -96,11 +184,18 @@ def main():
         default=0.02,
         help="判定碰撞的位移阈值（米），默认 0.02m（2cm）。",
     )
+    parser.add_argument(
+        "--close-camera",
+        action="store_true",
+        help="使用更近的相机位置（聚焦工作区域）。",
+    )
     args = parser.parse_args()
 
     output_dir = Path("videos/StackCube-v1")
     collision_dir = output_dir / "collision"
     collision_dir.mkdir(parents=True, exist_ok=True)
+    screenshot_dir = output_dir / "screenshots"
+    screenshot_dir.mkdir(parents=True, exist_ok=True)
 
     env = gym.make(
         "StackCube-v1",
@@ -108,6 +203,7 @@ def main():
         reward_mode="sparse",
         control_mode="pd_joint_pos",
         render_mode="rgb_array",
+        close_camera=args.close_camera,
     )
 
     env = RecordEpisode(
@@ -141,8 +237,19 @@ def main():
         # 记录初始位置（物理已稳定）
         init_positions = get_static_cube_positions(env)
 
+        # 定义截图回调函数（在机械臂抬高后调用）
+        def screenshot_callback():
+            save_initial_screenshots(
+                env, ep, screenshot_dir,
+                camera_names=["base_camera", "left_side_camera", "right_side_camera"],
+            )
+
         # do_reset=False 因为上面已经 reset 过了，避免重复 reset 导致 episode 被截断
-        res, home_steps = solve(env, seed=ep_seed, debug=False, vis=False, do_reset=False)
+        # after_home_callback 在机械臂抬高后截图，此时机械臂不遮挡视野
+        res, home_steps = solve(
+            env, seed=ep_seed, debug=False, vis=False,
+            do_reset=False, after_home_callback=screenshot_callback
+        )
         # 稳定步数也算在需要裁剪的前缀里
         home_steps += stable_steps
 

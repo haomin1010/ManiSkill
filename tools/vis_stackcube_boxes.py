@@ -61,7 +61,7 @@ def draw_dashed_rect(
     img_np: np.ndarray,
     center_uv: tuple[int, int],
     size: int,
-    color=(0, 255, 0),
+    color=(0, 0, 255),  # 蓝色（初始位置框）
     dash_len: int = 5,
     thickness: int = 2,
 ) -> np.ndarray:
@@ -119,14 +119,17 @@ def process_one_traj(
     camera_names: list[str],
     output_dir: Path,
     trim_head_steps: int = 0,
+    screenshot_dir: Path = None,
+    ep_idx: int = None,
 ):
     """
     对单条轨迹生成视频：
     - 从 obs/sensor_data 中读取每一步的 rgb
     - 从 obs/sensor_param 中读取相机参数
     - 从 env_states/actors 中读取 cubeA / cubeB 的世界坐标，构造目标点
-    - 对指定相机画 初始(绿) / 目标(蓝) 虚线框
+    - 对指定相机画 初始(蓝) / 目标(黄) 虚线框
     - 为每个相机分别写一个独立的视频文件（不再拼接）
+    - 如果 screenshot_dir 不为 None，保存第一帧的带框截图
     """
     group = h5_file[traj_id]
 
@@ -200,7 +203,7 @@ def process_one_traj(
             K = cam_param["intrinsic_cv"][t]
             extr = cam_param["extrinsic_cv"][t]
 
-            # 初始 cubeA (当下时刻的位置) 画绿框
+            # 初始 cubeA (当下时刻的位置) 画蓝框
             init_world = cubeA_pos[t]
             init_uv = project_world_to_pixel(init_world, K, extr)
             if init_uv is not None:
@@ -208,10 +211,10 @@ def process_one_traj(
                     rgb,
                     init_uv,
                     size=box_size,
-                    color=(0, 255, 0),
+                    color=(0, 0, 255),  # 蓝色（初始位置框）
                 )
 
-            # 目标位置（使用预先估计的 goal_pos[t]）画蓝框
+            # 目标位置（使用预先估计的 goal_pos[t]）画黄框
             g_world = goal_pos[t]
             g_uv = project_world_to_pixel(g_world, K, extr)
             if g_uv is not None:
@@ -219,12 +222,25 @@ def process_one_traj(
                     rgb,
                     g_uv,
                     size=box_size,
-                    color=(0, 0, 255),
+                    color=(255, 255, 0),  # 黄色（目标位置框）
                 )
 
             frames_per_camera[cam].append(rgb.astype(np.uint8))
 
     output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # 保存第一帧的带框截图
+    if screenshot_dir is not None and ep_idx is not None:
+        screenshot_dir = Path(screenshot_dir)
+        screenshot_dir.mkdir(parents=True, exist_ok=True)
+        for cam, frames in frames_per_camera.items():
+            if frames:
+                # 保存第一帧作为截图
+                first_frame = frames[0]
+                img_path = screenshot_dir / f"ep{ep_idx}_{cam}_boxed.png"
+                Image.fromarray(first_frame).save(img_path)
+        print(f"  带框截图已保存到: {screenshot_dir}")
+    
     # 每个相机单独写一个视频：{traj_id}_{cam}_boxed.mp4
     for cam, frames in frames_per_camera.items():
         if not frames:
@@ -233,11 +249,62 @@ def process_one_traj(
         images_to_video(frames, str(output_dir), video_name=video_name, fps=10, verbose=True)
 
 
+def compute_box_corners(center, box_size):
+    """根据中心点和框大小计算四个角的像素坐标"""
+    if center is None:
+        return None
+    cx, cy = center
+    half = box_size // 2
+    return {
+        "center": [cx, cy],
+        "top_left": [cx - half, cy - half],
+        "top_right": [cx + half, cy - half],
+        "bottom_left": [cx - half, cy + half],
+        "bottom_right": [cx + half, cy + half],
+    }
+
+
+def update_screenshot_json_with_corners(screenshot_dir, ep_idx, box_size):
+    """
+    读取 screenshot JSON 文件，根据 box_size 计算8个角点坐标，保存更新后的 JSON。
+    """
+    screenshot_dir = Path(screenshot_dir)
+    json_path = screenshot_dir / f"ep{ep_idx}_boxes.json"
+    
+    if not json_path.exists():
+        return None
+    
+    with json_path.open("r") as f:
+        data = json.load(f)
+    
+    # 添加 box_size 信息
+    data["box_size"] = box_size
+    
+    # 为每个相机计算8个角点
+    for cam_name, cam_data in data.get("cameras", {}).items():
+        init_center = cam_data.get("init_center_px")
+        goal_center = cam_data.get("goal_center_px")
+        
+        # 计算初始位置框的4个角（红色框）
+        cam_data["init_box_corners"] = compute_box_corners(init_center, box_size)
+        # 计算目标位置框的4个角（蓝色框）
+        cam_data["goal_box_corners"] = compute_box_corners(goal_center, box_size)
+    
+    # 保存更新后的 JSON
+    output_path = screenshot_dir / f"ep{ep_idx}_boxes_with_corners.json"
+    with output_path.open("w") as f:
+        json.dump(data, f, indent=2)
+    
+    print(f"  框角点坐标已保存到: {output_path}")
+    return data
+
+
 def main():
     args = parse_args()
     traj_path = Path(args.traj)
     meta_path = Path(args.meta) if args.meta is not None else traj_path.with_suffix(".json")
     output_dir = Path(args.output_dir) if args.output_dir is not None else traj_path.parent / "boxed"
+    screenshot_dir = traj_path.parent / "screenshots"
 
     if not traj_path.exists():
         raise FileNotFoundError(traj_path)
@@ -289,7 +356,13 @@ def main():
                 camera_names=camera_names,
                 output_dir=output_dir,
                 trim_head_steps=trim_head,
+                screenshot_dir=screenshot_dir,
+                ep_idx=ep_idx,
             )
+            
+            # 更新 screenshot JSON，添加8个角点坐标
+            if ep_idx is not None and screenshot_dir.exists():
+                update_screenshot_json_with_corners(screenshot_dir, ep_idx, args.box_size)
 
 
 if __name__ == "__main__":
