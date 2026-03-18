@@ -12,9 +12,17 @@ from mani_skill.examples.motionplanning.base_motionplanner.utils import (
     compute_grasp_info_by_obb, get_actor_obb)
 from mani_skill.utils.wrappers.record import RecordEpisode
 
-def solve(env: StackCubeEnv, seed=None, debug=False, vis=False):
-    print(f"[solve] start, seed={seed}")
-    env.reset(seed=seed)
+def solve(env: StackCubeEnv, seed=None, debug=False, vis=False, do_reset=True):
+    """
+    执行堆叠任务的 motion planning。
+    
+    Args:
+        do_reset: 是否在 solve 内部调用 env.reset()。
+                  如果外部已经 reset 过，设为 False 避免重复 reset。
+    """
+    print(f"[solve] start, seed={seed}, do_reset={do_reset}")
+    if do_reset:
+        env.reset(seed=seed)
     assert env.unwrapped.control_mode in [
         "pd_joint_pos",
         "pd_joint_pos_vel",
@@ -44,8 +52,10 @@ def solve(env: StackCubeEnv, seed=None, debug=False, vis=False):
     home_p[2] += 0.30  # 在当前姿态基础上抬高 30 cm
     home_q = tcp_pose.q[0].cpu().numpy().astype(np.float32)
     home_pose = sapien.Pose(p=home_p, q=home_q)
-    print("[solve] move to simple home pose (+0.3m)")
+    print(f"[solve] move to simple home pose (+0.3m), target_p={home_p}, current_p={cur_p}")
+    import sys; sys.stdout.flush()
     res_home = planner.move_to_pose_with_screw(home_pose)
+    print(f"[solve] home pose planning done")
     home_steps = int(planner.elapsed_steps)
     print(f"[solve] simple home pose result={res_home}, home_steps={home_steps}")
     # 若规划失败，不强制中止 episode，继续尝试后续任务
@@ -109,7 +119,8 @@ def solve(env: StackCubeEnv, seed=None, debug=False, vis=False):
     # -------------------------------------------------------------------------- #
     # Lift
     # -------------------------------------------------------------------------- #
-    lift_pose = sapien.Pose([0, 0, 0.1]) * grasp_pose
+    # 把红块抬高到足够高度，避免在水平移动时碰到堆叠塔上层的其它方块
+    lift_pose = sapien.Pose([0, 0, 0.25]) * grasp_pose
     print("[solve] lift after grasp")
     res_move = planner.move_to_pose_with_screw(lift_pose)
     print(f"[solve] lift pose result={res_move}")
@@ -136,23 +147,67 @@ def solve(env: StackCubeEnv, seed=None, debug=False, vis=False):
         return arr
 
     goal_p = _to_vec(goal_pose.p, 3)
-    cubeA_p = _to_vec(env.cubeA.pose.p, 3)
-    offset = goal_p - cubeA_p
-
     lift_p = _to_vec(lift_pose.p, 3)
     lift_q = _to_vec(lift_pose.q, 4)
 
-    target_p = lift_p + offset
-    target_q = lift_q
-    align_pose = sapien.Pose(
-        p=target_p.astype(np.float32),
-        q=target_q.astype(np.float32),
-    )
-    print("[solve] move to align (stack) pose")
-    res_move = planner.move_to_pose_with_screw(align_pose)
-    print(f"[solve] align pose result={res_move}")
+    # 计算红块需要旋转的角度，使其与 cubeB 对齐
+    # 提取 cubeA 和 cubeB 的 yaw（绕 z 轴旋转角度）
+    def quat_to_yaw(q):
+        # q = [w, x, y, z]，假设主要旋转是绕 z 轴
+        return 2.0 * np.arctan2(q[3], q[0])
+
+    def quat_mul(q1, q2):
+        # 四元数乘法，q = [w, x, y, z]
+        w1, x1, y1, z1 = q1
+        w2, x2, y2, z2 = q2
+        return np.array([
+            w1*w2 - x1*x2 - y1*y2 - z1*z2,
+            w1*x2 + x1*w2 + y1*z2 - z1*y2,
+            w1*y2 - x1*z2 + y1*w2 + z1*x2,
+            w1*z2 + x1*y2 - y1*x2 + z1*w2,
+        ], dtype=np.float32)
+
+    cubeA_q = _to_vec(env.cubeA.pose.q, 4)
+    cubeB_q = _to_vec(env.cubeB.pose.q, 4)
+    cubeA_yaw = quat_to_yaw(cubeA_q)
+    cubeB_yaw = quat_to_yaw(cubeB_q)
+    yaw_diff = cubeB_yaw - cubeA_yaw
+
+    # 正方体有 90° 旋转对称性，所以 yaw_diff 归一化到 [-45°, 45°] 范围
+    # 这样可以避免多转半圈
+    while yaw_diff > np.pi / 4:
+        yaw_diff -= np.pi / 2
+    while yaw_diff < -np.pi / 4:
+        yaw_diff += np.pi / 2
+    print(f"[solve] cubeA_yaw={np.degrees(cubeA_yaw):.1f}°, cubeB_yaw={np.degrees(cubeB_yaw):.1f}°, adjusted_diff={np.degrees(yaw_diff):.1f}°")
+
+    # 构造绕世界 z 轴旋转 yaw_diff 的四元数
+    q_rot = np.array([np.cos(yaw_diff / 2), 0, 0, np.sin(yaw_diff / 2)], dtype=np.float32)
+    # 左乘：在世界坐标系中绕 z 轴旋转
+    place_q = quat_mul(q_rot, lift_q)
+
+    # 分两步：先移到目标正上方高处（pre-place），再垂直下放到目标位置（place）
+    # 这样可以避免在水平移动时碰到堆叠塔最上层的其它方块
+
+    # 1) pre-place：目标 xy 位置，但保持 lift 的高度，同时调整姿态
+    pre_place_p = np.array([goal_p[0], goal_p[1], lift_p[2]], dtype=np.float32)
+    pre_place_pose = sapien.Pose(p=pre_place_p, q=place_q)
+    print("[solve] move to pre-place pose (above target, aligned)")
+    res_move = planner.move_to_pose_with_screw(pre_place_pose)
+    print(f"[solve] pre-place pose result={res_move}")
     if res_move == -1:
-        print("[solve] fail to move to stack pose, abort episode")
+        print("[solve] fail to move to pre-place pose, abort episode")
+        planner.close()
+        return False, home_steps
+
+    # 2) place：垂直下放到目标位置
+    place_p = goal_p.astype(np.float32)
+    place_pose = sapien.Pose(p=place_p, q=place_q)
+    print("[solve] move to place pose (final stack)")
+    res_move = planner.move_to_pose_with_screw(place_pose)
+    print(f"[solve] place pose result={res_move}")
+    if res_move == -1:
+        print("[solve] fail to move to place pose, abort episode")
         planner.close()
         return False, home_steps
 

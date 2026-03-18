@@ -101,7 +101,8 @@ def main():
         # 注意：这里直接把带有 RecordEpisode wrapper 的 env 传给 solve，
         # 使轨迹与视频都从该 reset 开始记录。
         # solve 现在返回 (success, home_steps)，这里忽略 home_steps。
-        res, _ = solve(env, seed=ep_seed, debug=False, vis=False)
+        # do_reset=False 因为上面已经 reset 过了
+        res, _ = solve(env, seed=ep_seed, debug=False, vis=False, do_reset=False)
         # solve returns True/False style result; also check env info success if needed
         if res:
             num_success += 1
