@@ -12,13 +12,15 @@ from mani_skill.examples.motionplanning.base_motionplanner.utils import (
     compute_grasp_info_by_obb, get_actor_obb)
 from mani_skill.utils.wrappers.record import RecordEpisode
 
-def solve(env: StackCubeEnv, seed=None, debug=False, vis=False, do_reset=True):
+def solve(env: StackCubeEnv, seed=None, debug=False, vis=False, do_reset=True, after_home_callback=None):
     """
     执行堆叠任务的 motion planning。
     
     Args:
         do_reset: 是否在 solve 内部调用 env.reset()。
                   如果外部已经 reset 过，设为 False 避免重复 reset。
+        after_home_callback: 可选的回调函数，在机械臂抬高（home pose）完成后调用。
+                             用于在机械臂不遮挡视野时截图。
     """
     print(f"[solve] start, seed={seed}, do_reset={do_reset}")
     if do_reset:
@@ -59,6 +61,10 @@ def solve(env: StackCubeEnv, seed=None, debug=False, vis=False, do_reset=True):
     home_steps = int(planner.elapsed_steps)
     print(f"[solve] simple home pose result={res_home}, home_steps={home_steps}")
     # 若规划失败，不强制中止 episode，继续尝试后续任务
+
+    # 在机械臂抬高后调用回调（此时机械臂不遮挡视野，适合截图）
+    if after_home_callback is not None:
+        after_home_callback()
 
     obb = get_actor_obb(env.cubeA)
 

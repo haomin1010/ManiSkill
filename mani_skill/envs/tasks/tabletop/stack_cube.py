@@ -41,20 +41,28 @@ class StackCubeEnv(BaseEnv):
         robot_uids="panda_wristcam",
         robot_init_qpos_noise=0.02,
         num_distractor_cubes: int = 0,
+        close_camera: bool = False,
         **kwargs,
     ):
         self.robot_init_qpos_noise = robot_init_qpos_noise
         self.num_distractor_cubes = num_distractor_cubes
         self.distractor_cubes = []
+        self.close_camera = close_camera  # 是否使用更近的相机位置
         super().__init__(*args, robot_uids=robot_uids, **kwargs)
 
     @property
     def _default_sensor_configs(self):
-        # 中央相机
-        center_pose = sapien_utils.look_at(eye=[0.3, 0.0, 0.6], target=[-0.1, 0.0, 0.1])
-        # 左右两侧侧视相机（从 Y 轴正负方向看过来）
-        left_pose = sapien_utils.look_at(eye=[0.3, 0.25, 0.6], target=[-0.1, 0.0, 0.1])
-        right_pose = sapien_utils.look_at(eye=[0.3, -0.25, 0.6], target=[-0.1, 0.0, 0.1])
+        # 根据 close_camera 参数选择相机位置
+        if self.close_camera:
+            # 更近的相机位置，聚焦在工作区域
+            center_pose = sapien_utils.look_at(eye=[0.15, 0.0, 0.35], target=[0.0, 0.0, 0.04])
+            left_pose = sapien_utils.look_at(eye=[0.15, 0.18, 0.35], target=[0.0, 0.0, 0.04])
+            right_pose = sapien_utils.look_at(eye=[0.15, -0.18, 0.35], target=[0.0, 0.0, 0.04])
+        else:
+            # 原来的相机位置（较远）
+            center_pose = sapien_utils.look_at(eye=[0.3, 0.0, 0.6], target=[-0.1, 0.0, 0.1])
+            left_pose = sapien_utils.look_at(eye=[0.3, 0.25, 0.6], target=[-0.1, 0.0, 0.1])
+            right_pose = sapien_utils.look_at(eye=[0.3, -0.25, 0.6], target=[-0.1, 0.0, 0.1])
 
         # 提高分辨率，避免后处理视频画面太小
         width = 512
@@ -129,10 +137,18 @@ class StackCubeEnv(BaseEnv):
         # - cubeA：红色，可移动的“待摆放积木”
         # - extra_red_cubes：额外的红色背景方块，只作为干扰物，不被专家控制
         # - cubeB + extra_green_cubes：堆叠在一起的目标积木，每个块一种鲜艳颜色，便于区分
+        # 为 cubeA 和背景方块准备一组鲜艳的颜色
+        self.distractor_colors = [
+            [1.0, 0.0, 0.0, 1.0],   # 红
+            [1.0, 0.0, 0.5, 1.0],   # 玫红
+            [0.5, 0.0, 1.0, 1.0],   # 紫蓝
+            [1.0, 0.5, 0.5, 1.0],   # 浅红
+        ]
+        
         self.cubeA = actors.build_cube(
             self.scene,
             half_size=0.02,
-            color=[1, 0, 0, 1],
+            color=self.distractor_colors[0],  # 初始颜色，会在 _initialize_episode 中随机
             name="cubeA",
             initial_pose=sapien.Pose(p=[0, 0, 0.1]),
         )
@@ -143,8 +159,8 @@ class StackCubeEnv(BaseEnv):
             cube = actors.build_cube(
                 self.scene,
                 half_size=0.02,
-                color=[1, 0, 0, 1],
-                name=f"red_static_{i}",
+                color=self.distractor_colors[(i + 1) % len(self.distractor_colors)],
+                name=f"distractor_{i}",
                 initial_pose=sapien.Pose(p=[0.0, 0.0, -1.0]),
             )
             self.extra_red_cubes.append(cube)
