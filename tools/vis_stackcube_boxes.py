@@ -185,6 +185,9 @@ def process_one_traj(
 
     # 为每个相机单独维护一组帧
     frames_per_camera: dict[str, list[np.ndarray]] = {cam: [] for cam in camera_names}
+    # 保存同一帧的原图和带框图（每个相机各一张）
+    first_raw_per_camera: dict[str, np.ndarray] = {}
+    first_boxed_per_camera: dict[str, np.ndarray] = {}
 
     for t in range(start_t, T):
         for cam in camera_names:
@@ -197,7 +200,10 @@ def process_one_traj(
             # rgb: (T, H, W, 3)
             if "rgb" not in cam_data:
                 continue
-            rgb = cam_data["rgb"][t]  # (H, W, 3)
+            rgb_raw = cam_data["rgb"][t]  # (H, W, 3)
+            if rgb_raw.dtype != np.uint8:
+                rgb_raw = (rgb_raw * 255).astype(np.uint8) if rgb_raw.max() <= 1.0 else rgb_raw.astype(np.uint8)
+            rgb = rgb_raw.copy()
 
             # intrinsic_cv: (T, 3, 3), extrinsic_cv: (T, 3, 4)
             K = cam_param["intrinsic_cv"][t]
@@ -225,21 +231,26 @@ def process_one_traj(
                     color=(255, 255, 0),  # 黄色（目标位置框）
                 )
 
-            frames_per_camera[cam].append(rgb.astype(np.uint8))
+            rgb_boxed = rgb.astype(np.uint8)
+            frames_per_camera[cam].append(rgb_boxed)
+
+            if cam not in first_raw_per_camera:
+                first_raw_per_camera[cam] = rgb_raw.astype(np.uint8)
+                first_boxed_per_camera[cam] = rgb_boxed
 
     output_dir.mkdir(parents=True, exist_ok=True)
     
-    # 保存第一帧的带框截图
+    # 保存第一帧的原图和带框截图（同一帧）
     if screenshot_dir is not None and ep_idx is not None:
         screenshot_dir = Path(screenshot_dir)
         screenshot_dir.mkdir(parents=True, exist_ok=True)
-        for cam, frames in frames_per_camera.items():
-            if frames:
-                # 保存第一帧作为截图
-                first_frame = frames[0]
-                img_path = screenshot_dir / f"ep{ep_idx}_{cam}_boxed.png"
-                Image.fromarray(first_frame).save(img_path)
-        print(f"  带框截图已保存到: {screenshot_dir}")
+        for cam in camera_names:
+            if cam in first_raw_per_camera:
+                raw_path = screenshot_dir / f"ep{ep_idx}_{cam}.png"
+                boxed_path = screenshot_dir / f"ep{ep_idx}_{cam}_boxed.png"
+                Image.fromarray(first_raw_per_camera[cam]).save(raw_path)
+                Image.fromarray(first_boxed_per_camera[cam]).save(boxed_path)
+        print(f"  同帧原图与带框截图已保存到: {screenshot_dir}")
     
     # 每个相机单独写一个视频：{traj_id}_{cam}_boxed.mp4
     for cam, frames in frames_per_camera.items():
