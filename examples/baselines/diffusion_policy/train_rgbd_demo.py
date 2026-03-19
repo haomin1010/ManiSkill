@@ -179,7 +179,7 @@ class Args:
     """the frequency of evaluating the agent on the evaluation environments"""
     save_freq: Optional[int] = None
     """the frequency of saving the model checkpoints. By default this is None and will only save checkpoints based on the best evaluation metrics."""
-    num_eval_episodes: int = 100
+    num_eval_episodes: int = 20
     """the number of episodes to evaluate the agent on"""
     num_eval_envs: int = 10
     """the number of parallel environments to evaluate the agent on"""
@@ -219,38 +219,56 @@ class SmallDemoDataset_DiffusionPolicy(Dataset):  # Load everything into memory
 
         print("Raw trajectory loaded, beginning observation pre-processing...")
         
-        # Extract traj_ids to map to boxed mp4 files
+        # Extract traj_ids and orig_episode_id 映射（用于 boxed 视频文件名）
         with h5py.File(data_path, "r") as f:
             all_keys = [k for k in f.keys() if k.startswith("traj_")]
             all_keys = sorted(all_keys, key=lambda x: int(x.split("_")[-1]))
             if num_traj is not None:
                 all_keys = all_keys[:num_traj]
+            # orig_episode_id 与视频文件名 traj_{id}_{cam}_boxed.mp4 对应
+            orig_episode_ids = []
+            for k in all_keys:
+                v = f[k].attrs.get("orig_episode_id", int(k.split("_")[-1]))
+                orig_episode_ids.append(int(v))
         
+        screenshot_dir = Path(data_path).parent / "screenshots"
         boxed_dir = Path(data_path).parent / "boxed"
 
         # Pre-process the observations, make them align with the obs returned by the obs_wrapper
         obs_traj_dict_list = []
         for i, obs_traj_dict in enumerate(trajectories["observations"]):
             traj_id = all_keys[i]
-            
-            # --- Read Visual Prompt from MP4 ---
+            vid = orig_episode_ids[i]  # 用于 screenshot / boxed 文件名
+
+            # 先 reorder，使 sensor_data 只保留与 env 一致的相机（忽略 H5 中多出的 left/right 等）
+            _obs_traj_dict = reorder_keys(obs_traj_dict, obs_space)
+            # --- Read Visual Prompt: 使用与 rgb 相同的相机子集，保证通道数一致 ---
             prompt_list = []
-            for cam in obs_traj_dict["sensor_data"].keys():
-                if "rgb" not in obs_traj_dict["sensor_data"][cam]:
+            for cam in _obs_traj_dict["sensor_data"].keys():
+                if "rgb" not in _obs_traj_dict["sensor_data"][cam]:
                     continue
-                mp4_path = boxed_dir / f"{traj_id}_{cam}_boxed.mp4"
-                if mp4_path.exists():
-                    cap = cv2.VideoCapture(str(mp4_path))
-                    ret, frame = cap.read()
-                    cap.release()
-                    if ret:
-                        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                        frame = cv2.resize(frame, (128, 128))
-                        prompt_list.append(frame)
-                        continue
-                # Fallback to unboxed frame 0 resized to 128x128
-                raw_frame = obs_traj_dict["sensor_data"][cam]["rgb"][0]
-                prompt_list.append(cv2.resize(raw_frame, (128, 128)))
+                frame = None
+                # 1) 优先 screenshots/ep{vid}_{cam}_boxed.png
+                png_path = screenshot_dir / f"ep{vid}_{cam}_boxed.png"
+                if png_path.exists():
+                    img = cv2.imread(str(png_path))
+                    if img is not None:
+                        frame = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                # 2) 其次 boxed 视频第一帧
+                if frame is None:
+                    mp4_path = boxed_dir / f"traj_{vid}_{cam}_boxed.mp4"
+                    if mp4_path.exists():
+                        cap = cv2.VideoCapture(str(mp4_path))
+                        ret, frame = cap.read()
+                        cap.release()
+                        if ret:
+                            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                # 3) 最后用轨迹中的未画框第一帧
+                if frame is None:
+                    raw_frame = _obs_traj_dict["sensor_data"][cam]["rgb"][0]
+                    frame = raw_frame
+                frame = cv2.resize(frame, (128, 128))
+                prompt_list.append(frame)
             
             if len(prompt_list) > 0:
                 # Resize all frames to 128x128 (same as convert_obs target_size) before concatenating
@@ -264,12 +282,17 @@ class SmallDemoDataset_DiffusionPolicy(Dataset):  # Load everything into memory
             else:
                 prompt_tensor = None
                 
-            obs_traj_dict.pop("prompt_rgb", None) # Clean up if it exists in H5
-            
-            _obs_traj_dict = reorder_keys(
-                obs_traj_dict, obs_space
-            )  # key order in demo is different from key order in env obs
+            obs_traj_dict.pop("prompt_rgb", None)  # Clean up if it exists in H5
+
             _obs_traj_dict = obs_process_fn(_obs_traj_dict)
+            # [DEBUG] 第一个轨迹：记录 H5 数据的相机数与 rgb 通道
+            if i == 0:
+                h5_cams = list(obs_traj_dict["sensor_data"].keys())
+                h5_cams_with_rgb = [c for c in h5_cams if "rgb" in obs_traj_dict["sensor_data"][c]]
+                rgb_shape = _obs_traj_dict["rgb"].shape
+                print(f"[DEBUG] Dataset 首条轨迹: H5 sensor_data 相机列表 = {h5_cams_with_rgb}, 数量 = {len(h5_cams_with_rgb)}")
+                print(f"[DEBUG] Dataset 首条轨迹: convert_obs 后 rgb.shape = {rgb_shape}, 通道数(最后一维或 dim=1) = "
+                      f"{rgb_shape[-1] if len(rgb_shape) == 3 else rgb_shape[1]}")
             
             if self.include_depth:
                 _obs_traj_dict["depth"] = torch.Tensor(
@@ -407,9 +430,15 @@ class Agent(nn.Module):
         self.include_depth = "depth" in env.single_observation_space.keys()
 
         if self.include_rgb:
-            total_visual_channels += env.single_observation_space["rgb"].shape[-1]
+            rgb_shape = env.single_observation_space["rgb"].shape
+            total_visual_channels += rgb_shape[-1]
+            print(f"[DEBUG] Agent: env.single_observation_space['rgb'].shape = {rgb_shape}, "
+                  f"取 shape[-1] 作为 rgb 通道数 = {rgb_shape[-1]} (若此处不是 C，可能导致 conv 通道错位)")
         if self.include_depth:
-            total_visual_channels += env.single_observation_space["depth"].shape[-1]
+            depth_shape = env.single_observation_space["depth"].shape
+            total_visual_channels += depth_shape[-1]
+            print(f"[DEBUG] Agent: env.single_observation_space['depth'].shape = {depth_shape}")
+        print(f"[DEBUG] Agent: total_visual_channels = {total_visual_channels} (PlainConv in_channels)")
 
         visual_feature_dim = 256
         self.visual_encoder = PlainConv(
@@ -689,6 +718,7 @@ if __name__ == "__main__":
         state_obs_extractor=build_state_obs_extractor(args.env_id),
         depth = "rgbd" in args.demo_path
     )
+    print(f"[DEBUG] obs_process_fn: depth={'rgbd' in args.demo_path} (由 demo_path 是否含 'rgbd' 决定)")
 
     # create temporary env to get original observation space as AsyncVectorEnv (CPU parallelization) doesn't permit that
     tmp_env = gym.make(args.env_id, **env_kwargs)
@@ -696,6 +726,11 @@ if __name__ == "__main__":
     # determine whether the env will return rgb and/or depth data
     include_rgb = tmp_env.unwrapped.obs_mode_struct.visual.rgb
     include_depth = tmp_env.unwrapped.obs_mode_struct.visual.depth
+    # [DEBUG] 记录 tmp_env 的相机数量（reset 后从 obs 读取，避免访问私有属性）
+    obs, _ = tmp_env.reset(seed=0)
+    if "sensor_data" in obs:
+        tmp_cams = [c for c in obs["sensor_data"] if "rgb" in obs["sensor_data"].get(c, {})]
+        print(f"[DEBUG] tmp_env 相机列表 (决定 H5 数据处理的通道顺序): {tmp_cams}, 数量={len(tmp_cams)}, 预期 rgb 通道数={len(tmp_cams)*3}")
     tmp_env.close()
 
     dataset = SmallDemoDataset_DiffusionPolicy(
@@ -718,6 +753,7 @@ if __name__ == "__main__":
         persistent_workers=(args.num_dataload_workers > 0),
     )
 
+    print(f"[DEBUG] 创建 Agent 前: envs.single_observation_space['rgb'].shape = {envs.single_observation_space['rgb'].shape}")
     agent = Agent(envs, args).to(device)
 
     optimizer = optim.AdamW(

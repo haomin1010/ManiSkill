@@ -1,3 +1,5 @@
+# 必须在宿主机环境运行
+
 # Diffusion Policy Training & Evaluation Summary
 
 **Task:** StackCube-v1 (RGB visual prompt with bounding box)
@@ -5,12 +7,11 @@
 
 **Training Command:**
 ``` python
-python train_rgbd_demo.py --env-id StackCube-v1 \
-  --demo-path /home/videos/StackCube-v1/stackcube_expert.rgb.pd_ee_delta_pos.physx_cpu.h5 \
+python examples/baselines/diffusion_policy/train_rgbd_demo.py --env-id StackCube-v1 \
+  --demo-path videos/StackCube-v1/stackcube_expert.rgb.pd_ee_delta_pos.physx_cpu.h5 \
   --control-mode "pd_ee_delta_pos" \
   --sim-backend "physx_cpu" \
-  --num-demos 19 \
-  --max_episode_steps 200 \
+  --max_episode_steps 300 \
   --total_iters 30000 \
   --obs-mode "rgb" \
   --exp-name diffusion_policy-StackCube-v1-rgb-delta-visual_prompt

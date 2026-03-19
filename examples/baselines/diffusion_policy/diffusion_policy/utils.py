@@ -157,6 +157,12 @@ def _resize_img_to(img: np.ndarray, target_h: int, target_w: int) -> np.ndarray:
 
 def convert_obs(obs, concat_fn, transpose_fn, state_obs_extractor, depth=True, target_size=(128, 128)):
     img_dict = obs["sensor_data"]
+    # [DEBUG] 首次调用时打印 sensor_data 的相机顺序（决定 concat 后的通道顺序）
+    if not hasattr(convert_obs, "_logged"):
+        cam_order = list(img_dict.keys())
+        n_cams = len([v for v in img_dict.values() if isinstance(v, dict) and "rgb" in v])
+        print(f"[DEBUG] convert_obs 首次调用: sensor_data 相机顺序 = {cam_order}, 含 rgb 的数量 = {n_cams}, 预期 C = {n_cams * 3}")
+        convert_obs._logged = True
     ls = ["rgb"]
     if depth:
         ls = ["rgb", "depth"]

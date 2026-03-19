@@ -83,7 +83,18 @@ class Args:
 
     num_envs: Annotated[int, tyro.conf.arg(aliases=["-n"])] = 1
     """Number of environments to run to replay trajectories. With CPU backends typically this is parallelized via python multiprocessing.
-    For parallelized simulation backends like physx_gpu, this is parallelized within a single python process by leveraging the GPU."""
+    For parallelized simulation backends like physx_gpu, it is parallelized within a single python process by leveraging the GPU."""
+
+    settling_steps: int = 15
+    """When control mode conversion yields is_cubeA_on_cubeB=True but is_cubeA_static=False (cube placed but still wobbling),
+    run this many zero-action steps to let physics settle before re-checking success. Only used for StackCube-like tasks. Set 0 to disable."""
+
+    skip_collision: bool = False
+    """Skip episodes marked as collision in the meta file (e.g. stackcube_expert_meta.json from save_record).
+    The meta path is inferred as {traj_dir}/{traj_stem}_meta.json, or use --skip-collision-meta to specify."""
+
+    skip_collision_meta: Optional[str] = None
+    """Path to meta JSON with per-episode collision flags. Default: {traj_dir}/{traj_stem}_meta.json when --skip-collision."""
 
 
 @dataclass
@@ -266,7 +277,8 @@ def replay_cpu_sim(
         for _ in range(args.max_retry + 1):
             # Each trial for each trajectory to replay, we reset the environment
             # and optionally set the first environment state
-            env.reset(**reset_kwargs)
+            # 传入 orig_episode_id 供 RecordEpisode 写入，并与 boxed 视频文件名映射
+            env.reset(orig_episode_id=episode_id, **reset_kwargs)
             if ori_env is not None:
                 ori_env.reset(**reset_kwargs)
 
@@ -357,6 +369,36 @@ def replay_cpu_sim(
             if args.discard_timeout:
                 success = success and (not truncated)
 
+            # Settling: 若方块已堆叠但未静止，多跑几步零动作让物理 settle
+            def _to_scalar(v):
+                if v is None:
+                    return None
+                if hasattr(v, "item"):
+                    return v.item()
+                if hasattr(v, "__iter__") and len(v) > 0:
+                    return _to_scalar(v[0])
+                return v
+
+            if (
+                not success
+                and not args.allow_failure
+                and args.settling_steps > 0
+            ):
+                on_top = _to_scalar(info.get("is_cubeA_on_cubeB", False))
+                grasped = _to_scalar(info.get("is_cubeA_grasped", True))
+                if on_top and not grasped:
+                    # 方块已放好、夹爪已松，只差静止判定；运行 settling 步
+                    shape = env.action_space.shape
+                    zero_action = np.zeros(
+                        shape if isinstance(shape, tuple) else (shape,),
+                        dtype=np.float32,
+                    )
+                    for _ in range(args.settling_steps):
+                        _, _, _, truncated, info = env.step(zero_action)
+                    success = info.get("success", False)
+                    if args.discard_timeout:
+                        success = success and (not truncated)
+
             if success or args.allow_failure:
                 successful_replays += 1
                 if args.save_traj:
@@ -369,7 +411,22 @@ def replay_cpu_sim(
                     print("info", info)
         else:
             env.flush_video(save=False)
-            tqdm.write(f"Episode {episode_id} is not replayed successfully. Skipping")
+            # [DEBUG] 打印失败原因，便于排查 pd_joint_pos -> pd_ee_delta_pos 转换为何未达成 success
+            def _to_scalar(v):
+                if hasattr(v, "item"):
+                    return v.item()
+                if hasattr(v, "__iter__") and len(v) > 0:
+                    return _to_scalar(v[0])
+                return v
+            reason = []
+            for k in ["success", "is_cubeA_on_cubeB", "is_cubeA_static", "is_cubeA_grasped"]:
+                if k in info:
+                    reason.append(f"{k}={_to_scalar(info[k])}")
+            reason_str = ", ".join(reason) if reason else str(info)
+            tqdm.write(
+                f"Episode {episode_id} is not replayed successfully. Skipping "
+                f"(reason: {reason_str}). Use --allow-failure to save anyway for IL."
+            )
 
     return ReplayResult(
         num_replays=len(episodes), successful_replays=successful_replays
@@ -457,6 +514,23 @@ def _main(
         output_h5_path = None
 
     episodes = json_data["episodes"][: args.count]
+
+    # 根据 meta 中的 collision 标记排除碰撞 episode
+    if args.skip_collision:
+        meta_path = args.skip_collision_meta
+        if meta_path is None:
+            traj_dir = os.path.dirname(traj_path)
+            traj_stem = os.path.splitext(os.path.basename(traj_path))[0]
+            meta_path = os.path.join(traj_dir, f"{traj_stem}_meta.json")
+        if os.path.exists(meta_path):
+            collision_meta = io_utils.load_json(meta_path)
+            orig_len = len(episodes)
+            episodes = [ep for ep in episodes if not collision_meta.get(str(ep["episode_id"]), {}).get("collision", False)]
+            skipped = orig_len - len(episodes)
+            if skipped > 0:
+                logger.info(f"Skipping {skipped} collision episode(s) (meta: {meta_path})")
+        else:
+            logger.warning(f"--skip-collision set but meta file not found: {meta_path}, proceeding without filtering")
     if use_cpu_backend:
         inds = np.arange(len(episodes))
         inds = np.array_split(inds, num_procs)[proc_id]

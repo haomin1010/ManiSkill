@@ -241,6 +241,7 @@ class RecordEpisode(gym.Wrapper):
         self.video_fps = video_fps
         self._elapsed_record_steps = 0
         self._episode_id = -1
+        self._last_orig_episode_id = None  # 用于与 boxed 视频映射
         self._video_id = -1
         self._video_steps = 0
         self._closed = False
@@ -374,6 +375,10 @@ class RecordEpisode(gym.Wrapper):
                     self.flush_trajectory(
                         env_idxs_to_flush=common.to_numpy(options["env_idx"]), save=save
                     )
+
+        # orig_episode_id 用于与 boxed 视频映射，不传给 base env
+        orig_episode_id = kwargs.pop("orig_episode_id", None)
+        self._last_orig_episode_id = orig_episode_id
 
         obs, info = super().reset(*args, seed=seed, options=options, **kwargs)
         if info["reconfigure"]:
@@ -645,6 +650,9 @@ class RecordEpisode(gym.Wrapper):
                     control_mode=self.base_env.control_mode,
                     elapsed_steps=end_ptr - start_ptr - 1,
                 )
+                if self._last_orig_episode_id is not None:
+                    episode_info["orig_episode_id"] = self._last_orig_episode_id
+                    group.attrs["orig_episode_id"] = self._last_orig_episode_id
                 if self.num_envs == 1:
                     episode_info.update(reset_kwargs=self.last_reset_kwargs)
                 else:

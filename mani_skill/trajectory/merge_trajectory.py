@@ -64,7 +64,18 @@ def merge_trajectories(output_path: str, traj_paths: list, recompute_id: bool = 
                 assert new_traj_id not in merged_h5_file, new_traj_id
                 h5_file.copy(traj_id, merged_h5_file, new_traj_id)
 
-                # Copy json data
+                # 复制 H5 属性（含 orig_episode_id，用于与 boxed 视频映射）
+                for attr_name in h5_file[traj_id].attrs:
+                    merged_h5_file[new_traj_id].attrs[attr_name] = (
+                        h5_file[traj_id].attrs[attr_name]
+                    )
+
+                # Copy json data，保留 orig_episode_id
+                if "orig_episode_id" not in ep and "orig_episode_id" in h5_file[traj_id].attrs:
+                    ep["orig_episode_id"] = int(h5_file[traj_id].attrs["orig_episode_id"])
+                elif "orig_episode_id" not in ep:
+                    ep["orig_episode_id"] = episode_id  # 回退到 episode_id
+
                 if recompute_id:
                     ep["episode_id"] = cnt
                 merged_json_data["episodes"].append(ep)

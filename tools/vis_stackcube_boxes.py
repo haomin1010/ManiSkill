@@ -54,6 +54,11 @@ def parse_args():
         action="store_true",
         help="跳过标记为碰撞的轨迹（需要 --meta-trim 中有 collision 字段）。",
     )
+    parser.add_argument(
+        "--save-boxed-video",
+        action="store_true",
+        help="是否生成带框的 mp4 视频（默认不生成，仅保存 screenshots 中的截图）。",
+    )
     return parser.parse_args()
 
 
@@ -121,6 +126,7 @@ def process_one_traj(
     trim_head_steps: int = 0,
     screenshot_dir: Path = None,
     ep_idx: int = None,
+    save_boxed_video: bool = False,
 ):
     """
     对单条轨迹生成视频：
@@ -183,10 +189,11 @@ def process_one_traj(
     sensor_data_grp = obs_grp["sensor_data"]
     sensor_param_grp = obs_grp["sensor_param"]
 
-    # 为每个相机单独维护一组帧
+    # 只截图时仅处理第一帧，生成视频时处理全部
     frames_per_camera: dict[str, list[np.ndarray]] = {cam: [] for cam in camera_names}
+    frame_indices = [start_t] if not save_boxed_video else list(range(start_t, T))
 
-    for t in range(start_t, T):
+    for t in frame_indices:
         for cam in camera_names:
             if cam not in sensor_data_grp:
                 # 如果该相机在这条轨迹里不存在，跳过
@@ -241,12 +248,13 @@ def process_one_traj(
                 Image.fromarray(first_frame).save(img_path)
         print(f"  带框截图已保存到: {screenshot_dir}")
     
-    # 每个相机单独写一个视频：{traj_id}_{cam}_boxed.mp4
-    for cam, frames in frames_per_camera.items():
-        if not frames:
-            continue
-        video_name = f"{traj_id}_{cam}_boxed"
-        images_to_video(frames, str(output_dir), video_name=video_name, fps=10, verbose=True)
+    # 每个相机单独写一个视频（仅当 save_boxed_video 时）
+    if save_boxed_video:
+        for cam, frames in frames_per_camera.items():
+            if not frames:
+                continue
+            video_name = f"{traj_id}_{cam}_boxed"
+            images_to_video(frames, str(output_dir), video_name=video_name, fps=10, verbose=True)
 
 
 def compute_box_corners(center, box_size):
@@ -358,6 +366,7 @@ def main():
                 trim_head_steps=trim_head,
                 screenshot_dir=screenshot_dir,
                 ep_idx=ep_idx,
+                save_boxed_video=args.save_boxed_video,
             )
             
             # 更新 screenshot JSON，添加8个角点坐标

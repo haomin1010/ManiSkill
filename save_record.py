@@ -189,11 +189,17 @@ def main():
         action="store_true",
         help="使用更近的相机位置（聚焦工作区域）。",
     )
+    parser.add_argument(
+        "--delete-collision-videos",
+        action="store_true",
+        help="检测到碰撞时直接删除视频，而非移动到 collision/ 目录。",
+    )
     args = parser.parse_args()
 
     output_dir = Path("videos/StackCube-v1")
     collision_dir = output_dir / "collision"
-    collision_dir.mkdir(parents=True, exist_ok=True)
+    if not args.delete_collision_videos:
+        collision_dir.mkdir(parents=True, exist_ok=True)
     screenshot_dir = output_dir / "screenshots"
     screenshot_dir.mkdir(parents=True, exist_ok=True)
 
@@ -223,6 +229,9 @@ def main():
     meta = {}
     collision_episodes = []
 
+    # [DEBUG] 数据生成阶段：首次 reset 后打印相机列表（将写入 H5 的 sensor_data）
+    _first_reset_done = False
+
     for ep in range(args.num_episodes):
         if args.base_seed is not None:
             ep_seed = int(args.base_seed) + ep
@@ -230,6 +239,11 @@ def main():
             ep_seed = None
 
         obs, info = env.reset(seed=ep_seed)
+
+        if not _first_reset_done:
+            cams = [c for c in obs.get("sensor_data", {}) if "rgb" in obs["sensor_data"].get(c, {})]
+            print(f"[DEBUG] save_record 数据生成: sensor_data 相机列表 = {cams}, 数量 = {len(cams)}, 预期 rgb 通道数 = {len(cams)*3}")
+            _first_reset_done = True
 
         # 等待物理引擎稳定（堆叠塔自然沉降），然后再记录初始位置
         stable_steps = wait_physics_stable(env, steps=10)
@@ -282,16 +296,39 @@ def main():
     with meta_path.open("w") as f:
         json.dump(meta, f, indent=2)
 
-    # 将碰撞 episode 的视频移动到 collision 目录
+    # 处理碰撞 episode 的视频和截图
+    camera_names_for_screenshots = ["base_camera", "left_side_camera", "right_side_camera"]
     if collision_episodes:
         print(f"\n发生碰撞的 episode: {collision_episodes}")
-        print(f"正在将碰撞视频移动到 {collision_dir} ...")
+        # 删除碰撞 episode 的截图和框坐标
+        print("正在删除碰撞 episode 的截图和框坐标 ...")
         for ep in collision_episodes:
-            video_file = output_dir / f"{ep}.mp4"
-            if video_file.exists():
-                dest = collision_dir / f"{ep}.mp4"
-                shutil.move(str(video_file), str(dest))
-                print(f"  移动: {video_file.name} -> collision/")
+            for cam in camera_names_for_screenshots:
+                png_path = screenshot_dir / f"ep{ep}_{cam}.png"
+                if png_path.exists():
+                    png_path.unlink()
+                    print(f"  删除: {png_path.name}")
+            for fname in [f"ep{ep}_boxes.json", f"ep{ep}_boxes_with_corners.json"]:
+                fp = screenshot_dir / fname
+                if fp.exists():
+                    fp.unlink()
+                    print(f"  删除: {fp.name}")
+        # 处理视频
+        if args.delete_collision_videos:
+            print("正在删除碰撞视频 ...")
+            for ep in collision_episodes:
+                video_file = output_dir / f"{ep}.mp4"
+                if video_file.exists():
+                    video_file.unlink()
+                    print(f"  删除: {video_file.name}")
+        else:
+            print(f"正在将碰撞视频移动到 {collision_dir} ...")
+            for ep in collision_episodes:
+                video_file = output_dir / f"{ep}.mp4"
+                if video_file.exists():
+                    dest = collision_dir / f"{ep}.mp4"
+                    shutil.move(str(video_file), str(dest))
+                    print(f"  移动: {video_file.name} -> collision/")
     else:
         print("\n没有检测到碰撞的 episode。")
 
