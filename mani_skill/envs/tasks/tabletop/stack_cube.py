@@ -134,36 +134,15 @@ class StackCubeEnv(BaseEnv):
             initial_pose=sapien.Pose(p=[workspace_half_x, 0.0, line_height]),
         )
         # 任务方块：
-        # - cubeA：红色，可移动的“待摆放积木”
-        # - extra_red_cubes：额外的红色背景方块，只作为干扰物，不被专家控制
+        # - cubeA：红色，可移动的“待摆放积木”（唯一红色目标块）
         # - cubeB + extra_green_cubes：堆叠在一起的目标积木，每个块一种鲜艳颜色，便于区分
-        # 为 cubeA 和背景方块准备一组鲜艳的颜色
-        self.distractor_colors = [
-            [1.0, 0.0, 0.0, 1.0],   # 红
-            [1.0, 0.0, 0.5, 1.0],   # 玫红
-            [0.5, 0.0, 1.0, 1.0],   # 紫蓝
-            [1.0, 0.5, 0.5, 1.0],   # 浅红
-        ]
-        
         self.cubeA = actors.build_cube(
             self.scene,
             half_size=0.02,
-            color=self.distractor_colors[0],  # 初始颜色，会在 _initialize_episode 中随机
+            color=[1.0, 0.0, 0.0, 1.0],  # 红
             name="cubeA",
             initial_pose=sapien.Pose(p=[0, 0, 0.1]),
         )
-        # 额外的红色方块，作为场景中的“背景方块”，不被专家直接操作
-        self.extra_red_cubes = []
-        num_extra_red = 3
-        for i in range(num_extra_red):
-            cube = actors.build_cube(
-                self.scene,
-                half_size=0.02,
-                color=self.distractor_colors[(i + 1) % len(self.distractor_colors)],
-                name=f"distractor_{i}",
-                initial_pose=sapien.Pose(p=[0.0, 0.0, -1.0]),
-            )
-            self.extra_red_cubes.append(cube)
         # 为堆叠积木准备一组不太浅、互相区分度高的颜色（不包含白色）
         stack_colors = [
             [0.0, 0.8, 0.0, 1.0],   # 绿
@@ -282,49 +261,6 @@ class StackCubeEnv(BaseEnv):
             shared_qs[:, 0] = qw
             shared_qs[:, 3] = qz
             self.cubeA.set_pose(Pose.create_from_pq(p=xyz.clone(), q=shared_qs))
-
-            # 为额外红块随机选择位置和轻微 yaw（只作为静态场景对象），
-            # 并尽量与堆叠塔中心 (0,0) 和 cubeA 保持一定距离，避免重叠在一起。
-            # 额外约束：红色块必须落在 4x4 白色线框之外。
-            if hasattr(self, "extra_red_cubes"):
-                # 4x4 白色线框的半边长（与 _load_scene 中的计算保持一致）
-                side = float(self.cube_half_size[0] * 8.0)
-                frame_half = side / 2.0
-                min_dist_from_stack = float(self.cube_half_size[0] * 6.0)  # 远离堆叠塔中心
-                min_dist_from_cubeA = float(self.cube_half_size[0] * 4.0)  # 与 cubeA 稍微拉开
-                cubeA_xy_np = base_xy[0].cpu().numpy()
-
-                for cube in self.extra_red_cubes:
-                    for _ in range(64):
-                        # 在稍大一些的区域里采样，鼓励远离中心堆叠塔
-                        xy = (torch.rand(2, device=self.device) * 0.8 - 0.4).cpu().numpy()
-                        # 与堆叠中心 (0,0) 的距离
-                        dist_stack = np.linalg.norm(xy)
-                        # 与 cubeA 的距离
-                        dist_cubeA = np.linalg.norm(xy - cubeA_xy_np)
-                        # 约束 1：必须在 4x4 白色线框之外（至少在 x 或 y 方向越出边界）
-                        outside_frame = (
-                            abs(xy[0]) > frame_half or abs(xy[1]) > frame_half
-                        )
-                        if (
-                            outside_frame
-                            and dist_stack > min_dist_from_stack
-                            and dist_cubeA > min_dist_from_cubeA
-                        ):
-                            break
-                    p = np.array(
-                        [xy[0], xy[1], float(self.cube_half_size[2])], dtype=np.float32
-                    )
-                    # 为每个额外红块单独采样一个小 yaw
-                    a = (np.random.rand() - 0.5) * (np.pi / 3.0)
-                    qw_r = np.cos(a / 2.0)
-                    qz_r = np.sin(a / 2.0)
-                    q = np.array([qw_r, 0.0, 0.0, qz_r], dtype=np.float32)
-                    pose = Pose.create_from_pq(
-                        p=torch.tensor([p], device=self.device),
-                        q=torch.tensor([q], device=self.device),
-                    )
-                    cube.set_pose(pose)
 
             # -------------------------------
             # 2) 绿色方块堆叠：总数 1~8 个，1~3 层，姿态对齐且规则栈叠

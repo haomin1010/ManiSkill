@@ -43,28 +43,34 @@ def get_commit_info(show_modified_files=False, show_untracked_files=False):
 
     try:
         repo = git.Repo(PACKAGE_DIR.parent)
-    except git.InvalidGitRepositoryError as err:
+    except (git.InvalidGitRepositoryError, git.NoSuchPathError):
         logger.warn("mani_skill is not installed with git.")
         return None
     else:
-        commit_info = {}
-        commit_info["commit_id"] = str(repo.head.commit)
-        commit_info["branch"] = (
-            None if repo.head.is_detached else repo.active_branch.name
-        )
+        try:
+            commit_info = {}
+            commit_info["commit_id"] = str(repo.head.commit)
+            commit_info["branch"] = (
+                None if repo.head.is_detached else repo.active_branch.name
+            )
 
-        if show_modified_files:
-            # https://stackoverflow.com/questions/33733453/get-changed-files-using-gitpython
-            modified_files = [item.a_path for item in repo.index.diff(None)]
-            commit_info["modified"] = modified_files
+            if show_modified_files:
+                # https://stackoverflow.com/questions/33733453/get-changed-files-using-gitpython
+                modified_files = [item.a_path for item in repo.index.diff(None)]
+                commit_info["modified"] = modified_files
 
-        if show_untracked_files:
-            repo.untracked_files
-            commit_info["untracked"] = modified_files
+            if show_untracked_files:
+                commit_info["untracked"] = repo.untracked_files
 
-        # https://github.com/gitpython-developers/GitPython/issues/718#issuecomment-360267779
-        repo.__del__()
-        return commit_info
+            return commit_info
+        except Exception as err:
+            # In some docker images, git metadata can be partial/corrupted, and
+            # GitPython may fail with BrokenPipeError while resolving HEAD.
+            logger.warn(f"Failed to collect git commit info: {err}")
+            return None
+        finally:
+            # https://github.com/gitpython-developers/GitPython/issues/718#issuecomment-360267779
+            repo.__del__()
 
 
 from .envs import *
