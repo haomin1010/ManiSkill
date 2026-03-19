@@ -3,8 +3,7 @@
 # Step 1: 用运动规划生成专家演示（pd_joint_pos，原始格式）
 # --delete-collision-videos: 检测到碰撞时删除视频，不保留到 collision/
 python save_record.py --num-episodes 10 --base-seed 42 --close-camera --delete-collision-videos
-# 生成带额外红色方块的数据
-# python save_record.py --num-episodes 10 --base-seed 42 --close-camera --num_extra_red_cubes 3
+# 生成带额外红色方块的数据 需要参数 --num_extra_red_cubes 3
 
 # Step 2: 重放轨迹，转换为 pd_ee_delta_pos + rgb 格式（供 diffusion policy 训练用）
 # --skip-collision: 跳过碰撞 episode，不重放、不保存到训练 H5
