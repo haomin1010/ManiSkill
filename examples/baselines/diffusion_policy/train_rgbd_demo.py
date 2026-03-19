@@ -34,6 +34,89 @@ from diffusion_policy.plain_conv import PlainConv
 from diffusion_policy.utils import (IterationBasedBatchSampler,
                                     build_state_obs_extractor, convert_obs,
                                     worker_init_fn)
+import PIL.Image as Image, PIL.ImageDraw as ImageDraw
+
+def project_world_to_pixel(P_world: np.ndarray, K: np.ndarray, extrinsic_cv: np.ndarray):
+    Pw = np.append(P_world.squeeze(), 1.0)
+    Pc = extrinsic_cv.squeeze() @ Pw
+    x, y, z = Pc.squeeze()
+    if z <= 0: return None
+    K = K.squeeze()
+    u = K[0, 0] * x / z + K[0, 2]
+    v = K[1, 1] * y / z + K[1, 2]
+    return int(round(u)), int(round(v))
+
+def draw_dashed_rect(img_np, center_uv, size, color=(0, 255, 0), dash_len=5, thickness=2):
+    u, v = center_uv
+    x0, y0 = int(u - size / 2), int(v - size / 2)
+    x1, y1 = int(u + size / 2), int(v + size / 2)
+    im = Image.fromarray(img_np)
+    draw = ImageDraw.Draw(im)
+    def dashed_line(p0, p1):
+        x0, y0 = p0; x1, y1 = p1
+        dx, dy = x1 - x0, y1 - y0
+        length = max(abs(dx), abs(dy))
+        if length == 0: return
+        for i in range(0, length, dash_len * 2):
+            t0, t1 = i / length, min(i + dash_len, length) / length
+            draw.line((x0 + dx*t0, y0 + dy*t0, x0 + dx*t1, y0 + dy*t1), fill=color, width=thickness)
+    dashed_line((x0, y0), (x1, y0)); dashed_line((x1, y0), (x1, y1))
+    dashed_line((x1, y1), (x0, y1)); dashed_line((x0, y1), (x0, y0))
+    return np.array(im)
+
+class FlattenRGBDAndPromptWrapper(gym.ObservationWrapper):
+    """Draws BBoxes dynamically and flattens observations into state, rgb, and prompt_rgb."""
+    def __init__(self, env):
+        self.base_env = env.unwrapped
+        super().__init__(env)
+        import copy
+        new_obs = self.observation(copy.deepcopy(self.base_env._init_raw_obs))
+        self.base_env.update_obs_space(new_obs)
+        self.base_env._init_raw_obs = copy.deepcopy(new_obs)
+        
+    def observation(self, observation: dict):
+        cubeA_pos = self.base_env.cubeA.pose.p
+        cubeB_pos = self.base_env.cubeB.pose.p
+        goal_pos = cubeB_pos + np.array([0.0, 0.0, 0.04]) # cube_half=0.02
+        
+        sensor_data = observation.pop("sensor_data")
+        sensor_param = observation.pop("sensor_param", None)
+        
+        rgb_images = []
+        prompt_list = []
+        
+        for cam, cam_data in sensor_data.items():
+            if "rgb" not in cam_data: continue
+            rgb = cam_data["rgb"]
+            rgb_images.append(rgb)
+            
+            drawn_np = rgb.cpu().numpy().copy() if isinstance(rgb, torch.Tensor) else rgb.copy()
+            if sensor_param is not None and cam in sensor_param and "intrinsic_cv" in sensor_param[cam]:
+                def to_np(v): return v.cpu().numpy() if isinstance(v, torch.Tensor) else v
+                K = to_np(sensor_param[cam]["intrinsic_cv"])
+                ext = to_np(sensor_param[cam]["extrinsic_cv"])
+                posA = to_np(cubeA_pos)
+                posB = to_np(goal_pos)
+                
+                # Image might have batch dimension (1, H, W, 3)
+                is_batched = (drawn_np.ndim == 4)
+                drawn_img = drawn_np[0] if is_batched else drawn_np
+                
+                uv_A = project_world_to_pixel(posA, K, ext)
+                if uv_A is not None: drawn_img = draw_dashed_rect(drawn_img, uv_A, 20, color=(0, 255, 0))
+                uv_B = project_world_to_pixel(posB, K, ext)
+                if uv_B is not None: drawn_img = draw_dashed_rect(drawn_img, uv_B, 20, color=(0, 0, 255))
+                
+                drawn_np = np.expand_dims(drawn_img, 0) if is_batched else drawn_img
+            
+            prompt_list.append(drawn_np)
+            
+        rgb_tensor = torch.concat([torch.as_tensor(x) for x in rgb_images], dim=-1)
+        prompt_tensor = torch.as_tensor(np.concatenate(prompt_list, axis=-1))
+        
+        from mani_skill.utils import common
+        state = common.flatten_state_dict(observation, use_torch=True, device=self.base_env.device)
+        return {"state": state, "rgb": rgb_tensor, "prompt_rgb": prompt_tensor}
 
 
 @dataclass
@@ -129,15 +212,65 @@ class SmallDemoDataset_DiffusionPolicy(Dataset):  # Load everything into memory
         trajectories = load_demo_dataset(data_path, num_traj=num_traj, concat=False)
         # trajectories['observations'] is a list of dict, each dict is a traj, with keys in obs_space, values with length L+1
         # trajectories['actions'] is a list of np.ndarray (L, act_dim)
+        import h5py
+        import cv2
+        import os
+        from pathlib import Path
+
         print("Raw trajectory loaded, beginning observation pre-processing...")
+        
+        # Extract traj_ids to map to boxed mp4 files
+        with h5py.File(data_path, "r") as f:
+            all_keys = [k for k in f.keys() if k.startswith("traj_")]
+            all_keys = sorted(all_keys, key=lambda x: int(x.split("_")[-1]))
+            if num_traj is not None:
+                all_keys = all_keys[:num_traj]
+        
+        boxed_dir = Path(data_path).parent / "boxed"
 
         # Pre-process the observations, make them align with the obs returned by the obs_wrapper
         obs_traj_dict_list = []
-        for obs_traj_dict in trajectories["observations"]:
+        for i, obs_traj_dict in enumerate(trajectories["observations"]):
+            traj_id = all_keys[i]
+            
+            # --- Read Visual Prompt from MP4 ---
+            prompt_list = []
+            for cam in obs_traj_dict["sensor_data"].keys():
+                if "rgb" not in obs_traj_dict["sensor_data"][cam]:
+                    continue
+                mp4_path = boxed_dir / f"{traj_id}_{cam}_boxed.mp4"
+                if mp4_path.exists():
+                    cap = cv2.VideoCapture(str(mp4_path))
+                    ret, frame = cap.read()
+                    cap.release()
+                    if ret:
+                        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                        frame = cv2.resize(frame, (128, 128))
+                        prompt_list.append(frame)
+                        continue
+                # Fallback to unboxed frame 0 resized to 128x128
+                raw_frame = obs_traj_dict["sensor_data"][cam]["rgb"][0]
+                prompt_list.append(cv2.resize(raw_frame, (128, 128)))
+            
+            if len(prompt_list) > 0:
+                # Resize all frames to 128x128 (same as convert_obs target_size) before concatenating
+                prompt_list = [
+                    cv2.resize(f, (128, 128)) if f.shape[:2] != (128, 128) else f
+                    for f in prompt_list
+                ]
+                prompt_rgb = np.concatenate(prompt_list, axis=-1)
+                prompt_rgb = prompt_rgb.transpose(2, 0, 1) # (C, H, W)
+                prompt_tensor = torch.from_numpy(prompt_rgb).to(device)
+            else:
+                prompt_tensor = None
+                
+            obs_traj_dict.pop("prompt_rgb", None) # Clean up if it exists in H5
+            
             _obs_traj_dict = reorder_keys(
                 obs_traj_dict, obs_space
             )  # key order in demo is different from key order in env obs
             _obs_traj_dict = obs_process_fn(_obs_traj_dict)
+            
             if self.include_depth:
                 _obs_traj_dict["depth"] = torch.Tensor(
                     _obs_traj_dict["depth"].astype(np.float32)
@@ -149,6 +282,10 @@ class SmallDemoDataset_DiffusionPolicy(Dataset):  # Load everything into memory
             _obs_traj_dict["state"] = torch.from_numpy(_obs_traj_dict["state"]).to(
                 device
             )
+            
+            if prompt_tensor is not None:
+                _obs_traj_dict["prompt_rgb"] = prompt_tensor
+            
             obs_traj_dict_list.append(_obs_traj_dict)
         trajectories["observations"] = obs_traj_dict_list
         self.obs_keys = list(_obs_traj_dict.keys())
@@ -214,13 +351,19 @@ class SmallDemoDataset_DiffusionPolicy(Dataset):  # Load everything into memory
         obs_traj = self.trajectories["observations"][traj_idx]
         obs_seq = {}
         for k, v in obs_traj.items():
+            if k == "prompt_rgb":
+                # Do not slice prompt_rgb, use the single trajectory-level 0-th frame prompt
+                continue
+                
             obs_seq[k] = v[
                 max(0, start) : start + self.obs_horizon
-            ]  # start+self.obs_horizon is at least 1
+            ].clone()  # clone to allow safe in-place modification
             if start < 0:  # pad before the trajectory
                 pad_obs_seq = torch.stack([obs_seq[k][0]] * abs(start), dim=0)
                 obs_seq[k] = torch.cat((pad_obs_seq, obs_seq[k]), dim=0)
-            # don't need to pad obs after the trajectory, see the above char drawing
+                
+        if "prompt_rgb" in obs_traj:
+            obs_seq["prompt_rgb"] = obs_traj["prompt_rgb"]  # (C, H, W)
 
         act_seq = self.trajectories["actions"][traj_idx][max(0, start) : end]
         if start < 0:  # pad before the trajectory
@@ -273,8 +416,8 @@ class Agent(nn.Module):
             in_channels=total_visual_channels, out_dim=visual_feature_dim, pool_feature_map=True
         )
         self.noise_pred_net = ConditionalUnet1D(
-            input_dim=self.act_dim,  # act_horizon is not used (U-Net doesn't care)
-            global_cond_dim=self.obs_horizon * (visual_feature_dim + obs_state_dim),
+            input_dim=self.act_dim,
+            global_cond_dim=self.obs_horizon * (visual_feature_dim + obs_state_dim) + (visual_feature_dim if self.include_rgb else 0),
             diffusion_step_embed_dim=args.diffusion_step_embed_dim,
             down_dims=args.unet_dims,
             n_groups=args.n_groups,
@@ -304,10 +447,23 @@ class Agent(nn.Module):
         visual_feature = visual_feature.reshape(
             batch_size, self.obs_horizon, visual_feature.shape[1]
         )  # (B, obs_horizon, D)
+        
+        # Concat history visuals with state
         feature = torch.cat(
             (visual_feature, obs_seq["state"]), dim=-1
         )  # (B, obs_horizon, D+obs_state_dim)
-        return feature.flatten(start_dim=1)  # (B, obs_horizon * (D+obs_state_dim))
+        flat_feature = feature.flatten(start_dim=1)  # (B, obs_horizon * (D+obs_state_dim))
+        
+        # Extract prompt feature and concat if it exists
+        if "prompt_rgb" in obs_seq:
+            prompt_rgb = obs_seq["prompt_rgb"].float() / 255.0
+            if hasattr(self, "aug") and not eval_mode:
+                prompt_rgb = self.aug(prompt_rgb)
+            
+            prompt_feature = self.visual_encoder(prompt_rgb) # (B, D)
+            return torch.cat([prompt_feature, flat_feature], dim=-1)
+        
+        return flat_feature
 
     def compute_loss(self, obs_seq, action_seq):
         B = obs_seq["state"].shape[0]
@@ -348,6 +504,15 @@ class Agent(nn.Module):
         with torch.no_grad():
             if self.include_rgb:
                 obs_seq["rgb"] = obs_seq["rgb"].permute(0, 1, 4, 2, 3)
+                if "prompt_rgb" in obs_seq:
+                    # In eval, prompt_rgb from VisualPromptWrapper may have an extra dimension 
+                    # and shape (B, num_stack, H, W, C). We only need index 0! 
+                    if obs_seq["prompt_rgb"].dim() == 5:
+                        # (B, obs_horizon, H, W, C) -> (B, H, W, C) -> (B, C, H, W)
+                        obs_seq["prompt_rgb"] = obs_seq["prompt_rgb"][:, 0].permute(0, 3, 1, 2)
+                    elif obs_seq["prompt_rgb"].dim() == 4:
+                        # (B, H, W, C) -> (B, C, H, W)
+                        obs_seq["prompt_rgb"] = obs_seq["prompt_rgb"].permute(0, 3, 1, 2)
             if self.include_depth:
                 obs_seq["depth"] = obs_seq["depth"].permute(0, 1, 4, 2, 3)
 
@@ -393,6 +558,49 @@ def save_ckpt(run_name, tag):
     )
 
 
+class VisualPromptWrapper:
+    """
+    Replaces the oldest observation in the FrameStack (index 0) with the initial observation 
+    of the current episode to serve as a fixed Visual Prompt.
+    """
+    def __init__(self, env):
+        self.env = env
+        self.initial_obs = None
+
+    def __getattr__(self, name):
+        return getattr(self.env, name)
+
+    def reset(self, **kwargs):
+        obs, info = self.env.reset(**kwargs)
+        self.initial_obs = {}
+        for k, v in obs.items():
+            if isinstance(v, torch.Tensor):
+                self.initial_obs[k] = v[:, 0].clone()
+            else:
+                self.initial_obs[k] = v[:, 0].copy()
+        return obs, info
+
+    def step(self, action):
+        obs, rew, term, trunc, info = self.env.step(action)
+        dones = term | trunc
+        
+        if hasattr(dones, "any") and dones.any():
+            for k in obs.keys():
+                if isinstance(obs[k], torch.Tensor):
+                    _dones_t = torch.from_numpy(dones).to(obs[k].device) if isinstance(dones, np.ndarray) else dones
+                    self.initial_obs[k][_dones_t] = obs[k][_dones_t, -1].clone() # Get newest frame instead of 0
+                else:
+                    _dones_np = dones.cpu().numpy() if isinstance(dones, torch.Tensor) else dones
+                    self.initial_obs[k][_dones_np] = obs[k][_dones_np, -1].copy()
+                    
+        # Overwrite all prompt_rgb history frames with initial_obs["prompt_rgb"] 
+        # so Agent.get_action will consistently see the $t=0$ prompt
+        if "prompt_rgb" in obs:
+            obs["prompt_rgb"][:] = self.initial_obs["prompt_rgb"][:, None, ...]
+            
+        return obs, rew, term, trunc, info
+
+
 if __name__ == "__main__":
     args = tyro.cli(Args)
 
@@ -433,7 +641,8 @@ if __name__ == "__main__":
         reward_mode="sparse",
         obs_mode=args.obs_mode,
         render_mode="rgb_array",
-        human_render_camera_configs=dict(shader_pack="default")
+        human_render_camera_configs=dict(shader_pack="default"),
+        sensor_configs=dict(width=128, height=128),
     )
     assert args.max_episode_steps != None, "max_episode_steps must be specified as imitation learning algorithms task solve speed is dependent on the data you train on"
     env_kwargs["max_episode_steps"] = args.max_episode_steps
@@ -445,8 +654,10 @@ if __name__ == "__main__":
         env_kwargs,
         other_kwargs,
         video_dir=f"runs/{run_name}/videos" if args.capture_video else None,
-        wrappers=[FlattenRGBDObservationWrapper],
+        wrappers=[FlattenRGBDAndPromptWrapper],
     )
+    # Apply Visual Prompt Wrapper
+    envs = VisualPromptWrapper(envs)
 
     if args.track:
         import wandb
