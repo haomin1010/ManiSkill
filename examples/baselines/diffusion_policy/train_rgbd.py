@@ -96,7 +96,7 @@ class Args:
     """the frequency of evaluating the agent on the evaluation environments"""
     save_freq: Optional[int] = None
     """the frequency of saving the model checkpoints. By default this is None and will only save checkpoints based on the best evaluation metrics."""
-    num_eval_episodes: int = 100
+    num_eval_episodes: int = 20
     """the number of episodes to evaluate the agent on"""
     num_eval_envs: int = 10
     """the number of parallel environments to evaluate the agent on"""
@@ -106,6 +106,8 @@ class Args:
     """the number of workers to use for loading the training data in the torch dataloader"""
     control_mode: str = "pd_joint_delta_pos"
     """the control mode to use for the evaluation environments. Must match the control mode of the demonstration dataset."""
+    close_camera: bool = False
+    """Use closer camera view (e.g. for StackCube). Must match the camera config used when recording demonstrations."""
 
     # additional tags/configs for logging purposes to wandb and shared comparisons with other algorithms
     demo_type: Optional[str] = None
@@ -471,6 +473,8 @@ if __name__ == "__main__":
     )
     assert args.max_episode_steps != None, "max_episode_steps must be specified as imitation learning algorithms task solve speed is dependent on the data you train on"
     env_kwargs["max_episode_steps"] = args.max_episode_steps
+    if args.close_camera:
+        env_kwargs["close_camera"] = True
     other_kwargs = dict(obs_horizon=args.obs_horizon)
     envs = make_eval_envs(
         args.env_id,

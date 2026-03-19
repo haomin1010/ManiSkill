@@ -50,5 +50,6 @@ def evaluate(n: int, agent, eval_envs, device, sim_backend: str, progress_bar: b
                     pbar.update(eval_envs.num_envs)
     agent.train()
     for k in eval_metrics.keys():
-        eval_metrics[k] = np.concatenate(eval_metrics[k])
+        arrs = [np.atleast_1d(a) for a in eval_metrics[k]]
+        eval_metrics[k] = np.concatenate(arrs)
     return eval_metrics

@@ -1,5 +1,7 @@
 from typing import Optional
 import gymnasium as gym
+import numpy as np
+import torch
 import mani_skill.envs
 from mani_skill.utils import gym_utils
 from mani_skill.utils.wrappers import CPUGymWrapper, FrameStack, RecordEpisode
@@ -32,6 +34,10 @@ def make_eval_envs(
             env_id, seed, video_dir=None, env_kwargs=dict(), other_kwargs=dict()
         ):
             def thunk():
+                # 每个 worker 使用不同种子，避免 AsyncVectorEnv fork 后所有子进程共享相同随机状态，
+                # 导致 StackCube 等环境的 reset 随机化（如绿色方块数量）在所有 eval env 中相同
+                np.random.seed(seed)
+                torch.manual_seed(seed)
                 env = gym.make(env_id, reconfiguration_freq=1, **env_kwargs)
                 for wrapper in wrappers:
                     env = wrapper(env)

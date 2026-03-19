@@ -189,6 +189,8 @@ class Args:
     """the number of workers to use for loading the training data in the torch dataloader"""
     control_mode: str = "pd_joint_delta_pos"
     """the control mode to use for the evaluation environments. Must match the control mode of the demonstration dataset."""
+    close_camera: bool = False
+    """Use closer camera view (e.g. for StackCube). Must match the camera config used when recording demonstrations."""
 
     # additional tags/configs for logging purposes to wandb and shared comparisons with other algorithms
     demo_type: Optional[str] = None
@@ -212,6 +214,7 @@ class SmallDemoDataset_DiffusionPolicy(Dataset):  # Load everything into memory
         trajectories = load_demo_dataset(data_path, num_traj=num_traj, concat=False)
         # trajectories['observations'] is a list of dict, each dict is a traj, with keys in obs_space, values with length L+1
         # trajectories['actions'] is a list of np.ndarray (L, act_dim)
+        import json
         import h5py
         import cv2
         import os
@@ -233,6 +236,13 @@ class SmallDemoDataset_DiffusionPolicy(Dataset):  # Load everything into memory
         
         screenshot_dir = Path(data_path).parent / "screenshots"
         boxed_dir = Path(data_path).parent / "boxed"
+
+        # 加载 meta 获取 trim_head，保证 prompt 各相机使用同一时刻的帧（与 screenshot 一致）
+        meta_path = Path(data_path).parent / f"{Path(data_path).stem.split('.')[0]}_meta.json"
+        trim_meta = {}
+        if meta_path.exists():
+            with open(meta_path, "r") as f:
+                trim_meta = json.load(f)
 
         # Pre-process the observations, make them align with the obs returned by the obs_wrapper
         obs_traj_dict_list = []
@@ -263,9 +273,15 @@ class SmallDemoDataset_DiffusionPolicy(Dataset):  # Load everything into memory
                         cap.release()
                         if ret:
                             frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                # 3) 最后用轨迹中的未画框第一帧
+                # 3) 最后用轨迹中的未画框帧（用 trim_head 与 screenshot 对齐，保证各相机同一时刻）
                 if frame is None:
-                    raw_frame = _obs_traj_dict["sensor_data"][cam]["rgb"][0]
+                    rgb_data = _obs_traj_dict["sensor_data"][cam]["rgb"]
+                    T = rgb_data.shape[0]
+                    trim_head = int(trim_meta.get(str(vid), {}).get("trim_head_steps", 0))
+                    frame_idx = min(max(0, trim_head), T - 1)
+                    raw_frame = rgb_data[frame_idx]
+                    if hasattr(raw_frame, "__array__"):
+                        raw_frame = np.asarray(raw_frame)
                     frame = raw_frame
                 frame = cv2.resize(frame, (128, 128))
                 prompt_list.append(frame)
@@ -675,6 +691,8 @@ if __name__ == "__main__":
     )
     assert args.max_episode_steps != None, "max_episode_steps must be specified as imitation learning algorithms task solve speed is dependent on the data you train on"
     env_kwargs["max_episode_steps"] = args.max_episode_steps
+    if args.close_camera:
+        env_kwargs["close_camera"] = True
     other_kwargs = dict(obs_horizon=args.obs_horizon)
     envs = make_eval_envs(
         args.env_id,
@@ -779,7 +797,7 @@ if __name__ == "__main__":
 
     # define evaluation and logging functions
     def evaluate_and_save_best(iteration):
-        if iteration % args.eval_freq == 0:
+        if iteration > 0 and iteration % args.eval_freq == 0:
             last_tick = time.time()
             ema.copy_to(ema_agent.parameters())
             eval_metrics = evaluate(
