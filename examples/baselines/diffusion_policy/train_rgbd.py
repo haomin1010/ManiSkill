@@ -435,6 +435,7 @@ if __name__ == "__main__":
     else:
         run_name = args.exp_name
 
+    demo_info = None
     if args.demo_path.endswith(".h5"):
         import json
 
@@ -473,6 +474,15 @@ if __name__ == "__main__":
     )
     assert args.max_episode_steps != None, "max_episode_steps must be specified as imitation learning algorithms task solve speed is dependent on the data you train on"
     env_kwargs["max_episode_steps"] = args.max_episode_steps
+    # Sync env-specific params from demo so eval env matches training data
+    if demo_info is not None:
+        demo_env_kwargs = demo_info.get("env_info", {}).get("env_kwargs", {})
+        for key in ["close_camera", "num_extra_red_cubes", "num_distractor_cubes"]:
+            if key in demo_env_kwargs:
+                env_kwargs[key] = demo_env_kwargs[key]
+        print(f"[env] Synced from demo: close_camera={env_kwargs.get('close_camera')}, "
+              f"num_extra_red_cubes={env_kwargs.get('num_extra_red_cubes')}, "
+              f"num_distractor_cubes={env_kwargs.get('num_distractor_cubes')}")
     if args.close_camera:
         env_kwargs["close_camera"] = True
     other_kwargs = dict(obs_horizon=args.obs_horizon)
