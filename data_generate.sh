@@ -1,8 +1,19 @@
 # 必须在docker环境之内运行
 
+NUM_EPISODES=300
+APPEND_FLAG=""
+
+while [[ "$#" -gt 0 ]]; do
+    case $1 in
+        --append|-a) APPEND_FLAG="--append"; shift ;;
+        --num-episodes) NUM_EPISODES="$2"; shift 2 ;;
+        *) echo "Unknown parameter passed: $1"; exit 1 ;;
+    esac
+done
+
 # Step 1: 用运动规划生成专家演示（pd_joint_pos，原始格式）
 # --delete-collision-videos: 检测到碰撞时删除视频，不保留到 collision/
-python save_record.py --num-episodes 50 --base-seed 42 --close-camera --delete-collision-videos
+python save_record.py --num-episodes $NUM_EPISODES --base-seed 42 --close-camera --delete-collision-videos $APPEND_FLAG
 # 生成带额外红色方块的数据 需要参数 --num_extra_red_cubes 3
 
 # Step 2: 重放轨迹，转换为 pd_ee_delta_pos + rgb 格式（供 diffusion policy 训练用）

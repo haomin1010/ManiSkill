@@ -194,6 +194,11 @@ def main():
         action="store_true",
         help="检测到碰撞时直接删除视频，而非移动到 collision/ 目录。",
     )
+    parser.add_argument(
+        "--append",
+        action="store_true",
+        help="在现有数据集上追加数据，而非覆盖。这会从现有的最大 epi 编号继续生成。",
+    )
     args = parser.parse_args()
 
     output_dir = Path("videos/StackCube-v1")
@@ -224,15 +229,27 @@ def main():
         record_env_state=True,
         source_type="motionplanning",
         source_desc="Panda motion planner expert demonstrations",
+        append_trajectory=args.append,
     )
 
     meta = {}
     collision_episodes = []
 
+    offset_ep = 0
+    if args.append:
+        meta_path = output_dir / "stackcube_expert_meta.json"
+        if meta_path.exists():
+            with meta_path.open("r") as f:
+                meta = json.load(f)
+            if meta:
+                ep_keys = [int(k) for k in meta.keys()]
+                offset_ep = max(ep_keys) + 1
+
     # [DEBUG] 数据生成阶段：首次 reset 后打印相机列表（将写入 H5 的 sensor_data）
     _first_reset_done = False
 
-    for ep in range(args.num_episodes):
+    for i in range(args.num_episodes):
+        ep = offset_ep + i
         if args.base_seed is not None:
             ep_seed = int(args.base_seed) + ep
         else:

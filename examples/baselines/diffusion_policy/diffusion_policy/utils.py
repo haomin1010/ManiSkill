@@ -233,4 +233,11 @@ def build_obs_space(env, depth_dtype, state_obs_extractor):
 def build_state_obs_extractor(env_id):
     # NOTE: You can tune/modify state observations specific to each environment here as you wish. By default we include all data
     # but in some use cases you might want to exclude e.g. obs["agent"]["qvel"] as qvel is not always something you query in the real world.
+    # 针对 PickCube 和 StackCube 任务，精准提取需要的本体特征，过滤掉 is_grasped 等特权信息
+    # if "StackCube" in env_id:
+    #     return lambda obs: [
+    #         obs["agent"]["qpos"],
+    #         obs["agent"]["qvel"],
+    #         obs["extra"]["tcp_pose"]
+    #     ]
     return lambda obs: list(obs["agent"].values()) + list(obs["extra"].values())

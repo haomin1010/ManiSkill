@@ -18,6 +18,23 @@ python examples/baselines/diffusion_policy/train_rgbd_demo.py --env-id StackCube
 
 ```
 
+```python
+python train_stackcube.py \
+    --demo-path videos/StackCube-v1/stackcube_expert.rgb.pd_ee_delta_pos.physx_cpu.h5 \
+    --num-eval-episodes 20 \
+    --total-iters 30000 
+
+  python train_stackcube.py \
+      --demo-path /home/user/ManiSkill/videos/StackCube-v1/stackcube_expert.rgb.pd_ee_delta_pos.physx_cpu.h5 \
+      --num-eval-episodes 20 \
+      --total-iters 30000
+python examples/baselines/diffusion_policy/train_stackcube.py \
+    --demo-path videos/StackCube-v1/stackcube_expert.rgb.pd_ee_delta_pos.physx_cpu.h5 \
+    --num-eval-episodes 20 \
+    --total-iters 30000                                                                                 
+                           
+```
+
 
 ## 1. Training Setup
 
