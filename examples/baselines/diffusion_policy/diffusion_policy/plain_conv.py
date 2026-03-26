@@ -42,8 +42,11 @@ class PlainConv(nn.Module):
         )
 
         if pool_feature_map:
-            self.pool = nn.AdaptiveMaxPool2d((1, 1))
-            self.fc = make_mlp(128, [out_dim], last_act=last_act)
+            # Use AvgPool to a 4x4 spatial grid instead of MaxPool(1,1).
+            # This preserves spatial location information (where in the image
+            # each feature is), which is critical for object localization tasks.
+            self.pool = nn.AdaptiveAvgPool2d((4, 4))
+            self.fc = make_mlp(128 * 4 * 4, [out_dim], last_act=last_act)
         else:
             self.pool = None
             self.fc = make_mlp(128 * 4 * 4 * 4, [out_dim], last_act=last_act)
