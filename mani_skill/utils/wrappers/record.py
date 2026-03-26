@@ -232,7 +232,6 @@ class RecordEpisode(gym.Wrapper):
         avoid_overwriting_video: bool = False,
         source_type: Optional[str] = None,
         source_desc: Optional[str] = None,
-        append_trajectory: bool = False,
     ) -> None:
         super().__init__(env)
 
@@ -270,32 +269,23 @@ class RecordEpisode(gym.Wrapper):
             if not trajectory_name:
                 trajectory_name = time.strftime("%Y%m%d_%H%M%S")
 
-            mode = "a" if append_trajectory else "w"
-            self._h5_file = h5py.File(self.output_dir / f"{trajectory_name}.h5", mode)
+            self._h5_file = h5py.File(self.output_dir / f"{trajectory_name}.h5", "w")
 
             # Use a separate json to store non-array data
             self._json_path = self._h5_file.filename.replace(".h5", ".json")
-            
-            if append_trajectory and Path(self._json_path).exists():
-                from mani_skill.utils.io_utils import load_json
-                self._json_data = load_json(self._json_path)
-                if len(self._json_data.get("episodes", [])) > 0:
-                    self._episode_id = max(ep["episode_id"] for ep in self._json_data["episodes"])
-                    self._video_id = self._episode_id
-            else:
-                self._json_data = dict(
-                    env_info=parse_env_info(self.env),
-                    commit_info=get_commit_info(),
-                    episodes=[],
-                )
-                if self._json_data["env_info"] is not None:
-                    self._json_data["env_info"][
-                        "max_episode_steps"
-                    ] = self.max_episode_steps
-                if source_type is not None:
-                    self._json_data["source_type"] = source_type
-                if source_desc is not None:
-                    self._json_data["source_desc"] = source_desc
+            self._json_data = dict(
+                env_info=parse_env_info(self.env),
+                commit_info=get_commit_info(),
+                episodes=[],
+            )
+            if self._json_data["env_info"] is not None:
+                self._json_data["env_info"][
+                    "max_episode_steps"
+                ] = self.max_episode_steps
+            if source_type is not None:
+                self._json_data["source_type"] = source_type
+            if source_desc is not None:
+                self._json_data["source_desc"] = source_desc
         self._save_video = save_video
         self.info_on_video = info_on_video
         self.render_images = []
