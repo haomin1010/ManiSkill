@@ -450,10 +450,8 @@ if __name__ == "__main__":
     is_distributed = world_size > 1
     is_master = (local_rank == 0)  # only rank 0 does eval / logging / ckpt
 
-    # NOTE: dist.init_process_group is intentionally deferred to right before
-    # DDP wrapping (after all env/dataset creation).  Calling it earlier would
-    # open CUDA contexts before physx_cpu AsyncVectorEnv forks worker processes,
-    # which causes a deadlock (fork-after-NCCL).
+    if is_distributed:
+        dist.init_process_group(backend="nccl")
 
     if torch.cuda.is_available() and args.cuda:
         device = torch.device(f"cuda:{local_rank}")
@@ -461,8 +459,11 @@ if __name__ == "__main__":
     else:
         device = torch.device("cpu")
 
-    # local_rank == dist.get_rank() on a single node, so no dist call needed yet.
-    rank_seed = args.seed + local_rank
+    if is_distributed:
+        # Offset each rank's seed so they sample different noise.
+        rank_seed = args.seed + dist.get_rank()
+    else:
+        rank_seed = args.seed
 
     if args.exp_name is None:
         args.exp_name = os.path.basename(__file__)[: -len(".py")]
@@ -591,7 +592,7 @@ if __name__ == "__main__":
         sampler = DistributedSampler(
             dataset,
             num_replicas=world_size,
-            rank=local_rank,  # local_rank == global rank on single-node
+            rank=dist.get_rank(),
             shuffle=True,
             seed=args.seed,
         )
@@ -620,11 +621,6 @@ if __name__ == "__main__":
     # Wire action normalization stats from the training dataset into the agent
     agent.action_min.copy_(dataset.action_min)
     agent.action_max.copy_(dataset.action_max)
-
-    # Initialize NCCL here — AFTER all env/dataset creation (which may fork
-    # subprocesses).  Forking after NCCL init causes deadlocks with physx_cpu.
-    if is_distributed:
-        dist.init_process_group(backend="nccl")
 
     # Wrap with DDP for multi-GPU gradient synchronization.
     # EMA and eval always operate on the underlying `agent`, not the DDP wrapper.
