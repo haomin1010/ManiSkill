@@ -8,10 +8,6 @@ from dataclasses import dataclass, field
 from functools import partial
 from typing import List, Optional
 
-import torch.distributed as dist
-from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data.distributed import DistributedSampler
-
 import gymnasium as gym
 from gymnasium.vector.vector_env import VectorEnv
 import numpy as np
@@ -441,30 +437,6 @@ def save_ckpt(run_name, tag):
 if __name__ == "__main__":
     args = tyro.cli(Args)
 
-    # ------------------------------------------------------------------ #
-    # DDP setup: torchrun injects LOCAL_RANK / WORLD_SIZE automatically.  #
-    # Falls back to single-GPU when launched with plain `python`.         #
-    # ------------------------------------------------------------------ #
-    local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    world_size = int(os.environ.get("WORLD_SIZE", 1))
-    is_distributed = world_size > 1
-    is_master = (local_rank == 0)  # only rank 0 does eval / logging / ckpt
-
-    if is_distributed:
-        dist.init_process_group(backend="nccl")
-
-    if torch.cuda.is_available() and args.cuda:
-        device = torch.device(f"cuda:{local_rank}")
-        torch.cuda.set_device(device)
-    else:
-        device = torch.device("cpu")
-
-    if is_distributed:
-        # Offset each rank's seed so they sample different noise.
-        rank_seed = args.seed + dist.get_rank()
-    else:
-        rank_seed = args.seed
-
     if args.exp_name is None:
         args.exp_name = os.path.basename(__file__)[: -len(".py")]
         run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
@@ -490,12 +462,14 @@ if __name__ == "__main__":
     assert args.obs_horizon + args.act_horizon - 1 <= args.pred_horizon
     assert args.obs_horizon >= 1 and args.act_horizon >= 1 and args.pred_horizon >= 1
 
-    random.seed(rank_seed)
-    np.random.seed(rank_seed)
-    torch.manual_seed(rank_seed)
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
     torch.backends.cudnn.deterministic = args.torch_deterministic
 
-    # create evaluation environment (rank 0 only)
+    device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
+
+    # create evaluation environment
     # sensor_configs resizes all cameras to 128×128 to avoid concat failures
     # when cameras have different resolutions (e.g. hand_camera=128 vs base_camera=512)
     env_kwargs = dict(
@@ -514,50 +488,42 @@ if __name__ == "__main__":
         for key in ["close_camera", "num_extra_red_cubes", "num_distractor_cubes"]:
             if key in demo_env_kwargs:
                 env_kwargs[key] = demo_env_kwargs[key]
-        if is_master:
-            print(f"[env] Synced from demo: close_camera={env_kwargs.get('close_camera')}, "
-                  f"num_extra_red_cubes={env_kwargs.get('num_extra_red_cubes')}, "
-                  f"num_distractor_cubes={env_kwargs.get('num_distractor_cubes')}")
+        print(f"[env] Synced from demo: close_camera={env_kwargs.get('close_camera')}, "
+              f"num_extra_red_cubes={env_kwargs.get('num_extra_red_cubes')}, "
+              f"num_distractor_cubes={env_kwargs.get('num_distractor_cubes')}")
     if args.close_camera:
         env_kwargs["close_camera"] = True
     other_kwargs = dict(obs_horizon=args.obs_horizon)
-    # Only rank-0 creates the eval environments; other ranks set envs=None.
-    if is_master:
-        envs = make_eval_envs(
-            args.env_id,
-            args.num_eval_envs,
-            args.sim_backend,
-            env_kwargs,
-            other_kwargs,
-            video_dir=f"runs/{run_name}/videos" if args.capture_video else None,
-            wrappers=[FlattenRGBDObservationWrapper],
-        )
-    else:
-        envs = None
+    envs = make_eval_envs(
+        args.env_id,
+        args.num_eval_envs,
+        args.sim_backend,
+        env_kwargs,
+        other_kwargs,
+        video_dir=f"runs/{run_name}/videos" if args.capture_video else None,
+        wrappers=[FlattenRGBDObservationWrapper],
+    )
 
-    if is_master:
-        if args.track:
-            import wandb
-            config = vars(args)
-            config["eval_env_cfg"] = dict(**env_kwargs, num_envs=args.num_eval_envs, env_id=args.env_id, env_horizon=args.max_episode_steps)
-            wandb.init(
-                project=args.wandb_project_name,
-                entity=args.wandb_entity,
-                sync_tensorboard=True,
-                config=config,
-                name=run_name,
-                save_code=True,
-                group="DiffusionPolicy",
-                tags=["diffusion_policy"],
-            )
-        writer = SummaryWriter(f"runs/{run_name}")
-        writer.add_text(
-            "hyperparameters",
-            "|param|value|\n|-|-|\n%s"
-            % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
+    if args.track:
+        import wandb
+        config = vars(args)
+        config["eval_env_cfg"] = dict(**env_kwargs, num_envs=args.num_eval_envs, env_id=args.env_id, env_horizon=args.max_episode_steps)
+        wandb.init(
+            project=args.wandb_project_name,
+            entity=args.wandb_entity,
+            sync_tensorboard=True,
+            config=config,
+            name=run_name,
+            save_code=True,
+            group="DiffusionPolicy",
+            tags=["diffusion_policy"],
         )
-    else:
-        writer = None
+    writer = SummaryWriter(f"runs/{run_name}")
+    writer.add_text(
+        "hyperparameters",
+        "|param|value|\n|-|-|\n%s"
+        % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
+    )
 
     obs_process_fn = partial(
         convert_obs,
@@ -586,48 +552,21 @@ if __name__ == "__main__":
         device=device,
         num_traj=args.num_demos
     )
-    # Each GPU sees a different shard of the data each epoch.
-    # batch_size is PER GPU, so total effective batch = batch_size × world_size.
-    if is_distributed:
-        sampler = DistributedSampler(
-            dataset,
-            num_replicas=world_size,
-            rank=dist.get_rank(),
-            shuffle=True,
-            seed=args.seed,
-        )
-    else:
-        sampler = RandomSampler(dataset, replacement=False)
+    sampler = RandomSampler(dataset, replacement=False)
     batch_sampler = BatchSampler(sampler, batch_size=args.batch_size, drop_last=True)
     batch_sampler = IterationBasedBatchSampler(batch_sampler, args.total_iters)
     train_dataloader = DataLoader(
         dataset,
         batch_sampler=batch_sampler,
         num_workers=args.num_dataload_workers,
-        worker_init_fn=lambda worker_id: worker_init_fn(worker_id, base_seed=rank_seed),
+        worker_init_fn=lambda worker_id: worker_init_fn(worker_id, base_seed=args.seed),
         persistent_workers=(args.num_dataload_workers > 0),
     )
 
-    # Build agent on a temporary single-env spec for shape inference.
-    # For non-master ranks, envs is None so we create a temporary env.
-    if envs is None:
-        _tmp_env = gym.make(args.env_id, **env_kwargs)
-        _agent_env = _tmp_env
-    else:
-        _agent_env = envs
-    agent = Agent(_agent_env, args).to(device)
-    if envs is None:
-        _tmp_env.close()
+    agent = Agent(envs, args).to(device)
     # Wire action normalization stats from the training dataset into the agent
     agent.action_min.copy_(dataset.action_min)
     agent.action_max.copy_(dataset.action_max)
-
-    # Wrap with DDP for multi-GPU gradient synchronization.
-    # EMA and eval always operate on the underlying `agent`, not the DDP wrapper.
-    if is_distributed:
-        ddp_agent = DDP(agent, device_ids=[local_rank])
-    else:
-        ddp_agent = agent
 
     optimizer = optim.AdamW(
         params=agent.parameters(), lr=args.lr, betas=(0.95, 0.999), weight_decay=1e-6
@@ -644,23 +583,17 @@ if __name__ == "__main__":
     # Exponential Moving Average
     # accelerates training and improves stability
     # holds a copy of the model weights
-    # NOTE: EMA tracks `agent` (not ddp_agent) so it works correctly on all ranks.
     ema = EMAModel(parameters=agent.parameters(), power=0.75)
-    if is_master:
-        ema_agent = Agent(envs, args).to(device)
-        # Wire action normalization stats into ema_agent too (not copied by EMAModel)
-        ema_agent.action_min.copy_(dataset.action_min)
-        ema_agent.action_max.copy_(dataset.action_max)
-    else:
-        ema_agent = None
+    ema_agent = Agent(envs, args).to(device)
+    # Wire action normalization stats into ema_agent too (not copied by EMAModel)
+    ema_agent.action_min.copy_(dataset.action_min)
+    ema_agent.action_max.copy_(dataset.action_max)
 
     best_eval_metrics = defaultdict(float)
     timings = defaultdict(float)
 
-    # define evaluation and logging functions (rank-0 only)
+    # define evaluation and logging functions
     def evaluate_and_save_best(iteration):
-        if not is_master:
-            return
         if iteration % args.eval_freq == 0:
             last_tick = time.time()
             ema.copy_to(ema_agent.parameters())
@@ -684,8 +617,6 @@ if __name__ == "__main__":
                         f"New best {k}_rate: {eval_metrics[k]:.4f}. Saving checkpoint."
                     )
     def log_metrics(iteration):
-        if not is_master:
-            return
         if iteration % args.log_freq == 0:
             writer.add_scalar(
                 "charts/learning_rate", optimizer.param_groups[0]["lr"], iteration
@@ -703,14 +634,11 @@ if __name__ == "__main__":
     for iteration, data_batch in enumerate(train_dataloader):
         timings["data_loading"] += time.time() - last_tick
 
-        # forward and compute loss (use ddp_agent so gradients are synced)
+        # forward and compute loss
         last_tick = time.time()
-        total_loss = ddp_agent.module.compute_loss(
+        total_loss = agent.compute_loss(
             obs_seq=data_batch["observations"],  # (B, obs_horizon, ...)
             action_seq=data_batch["actions"],  # (B, pred_horizon, act_dim)
-        ) if is_distributed else agent.compute_loss(
-            obs_seq=data_batch["observations"],
-            action_seq=data_batch["actions"],
         )
         timings["forward"] += time.time() - last_tick
 
@@ -722,28 +650,24 @@ if __name__ == "__main__":
         lr_scheduler.step()  # step lr scheduler every batch, this is different from standard pytorch behavior
         timings["backward"] += time.time() - last_tick
 
-        # ema step (always use the underlying agent, not DDP wrapper)
+        # ema step
         last_tick = time.time()
         ema.step(agent.parameters())
         timings["ema"] += time.time() - last_tick
 
-        # Evaluation and logging (rank 0 only)
+        # Evaluation
         evaluate_and_save_best(iteration)
         log_metrics(iteration)
 
-        # Checkpoint (rank 0 only)
-        if is_master and args.save_freq is not None and iteration % args.save_freq == 0:
+        # Checkpoint
+        if args.save_freq is not None and iteration % args.save_freq == 0:
             save_ckpt(run_name, str(iteration))
-        if is_master:
-            pbar.update(1)
-            pbar.set_postfix({"loss": total_loss.item()})
+        pbar.update(1)
+        pbar.set_postfix({"loss": total_loss.item()})
         last_tick = time.time()
 
     evaluate_and_save_best(args.total_iters)
     log_metrics(args.total_iters)
 
-    if is_master:
-        envs.close()
-        writer.close()
-    if is_distributed:
-        dist.destroy_process_group()
+    envs.close()
+    writer.close()
