@@ -19,10 +19,13 @@ def evaluate(n: int, agent, eval_envs, device, sim_backend: str, progress_bar: b
                 action_seq = action_seq.cpu().numpy()
             for i in range(action_seq.shape[1]):
                 obs, rew, terminated, truncated, info = eval_envs.step(action_seq[:, i])
+                # print(info.keys())
+                # breakpoint()
                 if truncated.any():
                     break
 
             if truncated.any():
+                # breakpoint()
                 assert truncated.all() == truncated.any(), "all episodes should truncate at the same time for fair evaluation with other algorithms"
                 if "final_info" in info:
                     # physx_cuda / newer gymnasium vector env: final episode info stored in final_info
