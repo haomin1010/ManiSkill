@@ -66,3 +66,89 @@ class PlainConv(nn.Module):
         x = x.flatten(1)
         x = self.fc(x)
         return x
+
+
+class ResNetEncoder(nn.Module):
+    """ResNet18-based visual encoder with spatial feature preservation.
+
+    Adapts the first conv layer to accept multi-channel input (e.g. 4 cameras
+    × 3 RGB = 12 channels) by averaging pretrained 3-channel weights across
+    groups. Preserves 4×4 spatial features before projecting to out_dim.
+
+    For 128×128 input, ResNet18 produces (512, 4, 4) before global pooling.
+    """
+
+    def __init__(self, in_channels=3, out_dim=256, pretrained=True):
+        super().__init__()
+        import torch
+        import torchvision.models as models
+
+        if pretrained:
+            resnet = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
+        else:
+            resnet = models.resnet18(weights=None)
+
+        # Adapt conv1 from 3 channels to in_channels
+        old_conv = resnet.conv1  # (64, 3, 7, 7)
+        new_conv = nn.Conv2d(
+            in_channels,
+            old_conv.out_channels,
+            kernel_size=old_conv.kernel_size,
+            stride=old_conv.stride,
+            padding=old_conv.padding,
+            bias=old_conv.bias is not None,
+        )
+        if pretrained and in_channels != 3:
+            # Repeat and average pretrained RGB weights across channel groups.
+            # For 12-channel input (4×RGB): copy the 3-channel weights 4 times,
+            # then scale down to preserve the expected activation magnitude.
+            with torch.no_grad():
+                w = old_conv.weight  # (64, 3, 7, 7)
+                repeats = in_channels // 3
+                remainder = in_channels % 3
+                parts = [w] * repeats
+                if remainder > 0:
+                    parts.append(w[:, :remainder, :, :])
+                new_w = torch.cat(parts, dim=1)  # (64, in_channels, 7, 7)
+                # Scale down to preserve pre-activation magnitude
+                new_w = new_w / (in_channels / 3)
+                new_conv.weight.copy_(new_w)
+        elif pretrained:
+            new_conv.weight.data.copy_(old_conv.weight.data)
+        resnet.conv1 = new_conv
+
+        # Build backbone: all layers except global avgpool and fc
+        # For 128×128 input: 128→64(conv1)→32(pool)→32(l1)→16(l2)→8(l3)→4(l4)
+        self.backbone = nn.Sequential(
+            resnet.conv1,
+            resnet.bn1,
+            resnet.relu,
+            resnet.maxpool,
+            resnet.layer1,
+            resnet.layer2,
+            resnet.layer3,
+            resnet.layer4,
+        )  # outputs (B, 512, 4, 4) for 128x128 input
+
+        # Keep 4×4 spatial grid (no-op for 128x128 but safe for other sizes)
+        self.pool = nn.AdaptiveAvgPool2d((4, 4))
+        self.fc = nn.Linear(512 * 4 * 4, out_dim)
+        self.out_dim = out_dim
+
+    def forward(self, x):
+        import torch
+        # Apply ImageNet normalization per 3-channel camera group.
+        # ResNet18 was pretrained expecting input in range [0,1] normalized
+        # with ImageNet mean/std. Without this, pretrained features are useless.
+        mean = torch.tensor([0.485, 0.456, 0.406], device=x.device, dtype=x.dtype)
+        std  = torch.tensor([0.229, 0.224, 0.225], device=x.device, dtype=x.dtype)
+        n_cams = x.shape[1] // 3
+        mean_full = mean.repeat(n_cams)[None, :, None, None]  # (1, C, 1, 1)
+        std_full  = std.repeat(n_cams)[None, :, None, None]
+        x = (x - mean_full) / std_full
+
+        x = self.backbone(x)   # (B, 512, 4, 4)
+        x = self.pool(x)       # (B, 512, 4, 4)
+        x = x.flatten(1)       # (B, 8192)
+        x = self.fc(x)         # (B, out_dim)
+        return x

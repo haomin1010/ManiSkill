@@ -30,7 +30,7 @@ from torch.utils.tensorboard import SummaryWriter
 from diffusion_policy.conditional_unet1d import ConditionalUnet1D
 from diffusion_policy.evaluate import evaluate
 from diffusion_policy.make_env import make_eval_envs
-from diffusion_policy.plain_conv import PlainConv
+from diffusion_policy.plain_conv import PlainConv, ResNetEncoder
 from diffusion_policy.utils import (IterationBasedBatchSampler,
                                     build_state_obs_extractor, convert_obs,
                                     worker_init_fn)
@@ -83,6 +83,10 @@ class Args:
     n_groups: int = (
         8  # jigu says it is better to let each group have at least 8 channels; it seems 4 and 8 are similar
     )
+    visual_feature_dim: int = 256
+    """output dimension of the visual encoder. Larger values give the UNet more rich visual conditioning."""
+    encoder: str = "plainconv"
+    """visual encoder type: 'plainconv' or 'resnet18'. resnet18 uses pretrained ImageNet weights."""
 
     # Environment/experiment specific arguments
     obs_mode: str = "rgb"
@@ -295,10 +299,21 @@ class Agent(nn.Module):
         if self.include_depth:
             total_visual_channels += env.single_observation_space["depth"].shape[-1]
 
-        visual_feature_dim = 256
-        self.visual_encoder = PlainConv(
-            in_channels=total_visual_channels, out_dim=visual_feature_dim, pool_feature_map=True
-        )
+        visual_feature_dim = args.visual_feature_dim
+        encoder_type = getattr(args, "encoder", "plainconv").lower()
+        if encoder_type == "resnet18":
+            self.visual_encoder = ResNetEncoder(
+                in_channels=total_visual_channels,
+                out_dim=visual_feature_dim,
+                pretrained=True,
+            )
+            print(f"[encoder] Using pretrained ResNet18 encoder (in_channels={total_visual_channels}, out_dim={visual_feature_dim})")
+        else:
+            self.visual_encoder = PlainConv(
+                in_channels=total_visual_channels, out_dim=visual_feature_dim, pool_feature_map=True
+            )
+            print(f"[encoder] Using PlainConv encoder (in_channels={total_visual_channels}, out_dim={visual_feature_dim})")
+
         self.noise_pred_net = ConditionalUnet1D(
             input_dim=self.act_dim,  # act_horizon is not used (U-Net doesn't care)
             global_cond_dim=self.obs_horizon * (visual_feature_dim + obs_state_dim),
