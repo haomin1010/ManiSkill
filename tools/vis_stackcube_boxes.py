@@ -67,10 +67,10 @@ def draw_dashed_rect(
     center_uv: tuple[int, int],
     size: int,
     color=(0, 0, 255),  # 蓝色（初始位置框）
-    dash_len: int = 5,
-    thickness: int = 2,
+    dash_len: int = 10,
+    thickness: int = 5,
 ) -> np.ndarray:
-    """在图像上以 center_uv 为中心画一个 size×size 的虚线矩形。"""
+    """在图像上以 center_uv 为中心画一个 size×size 的虚线矩形（仅虚线，无实线外框）。"""
     u, v = center_uv
     x0 = int(u - size / 2)
     y0 = int(v - size / 2)
@@ -81,20 +81,20 @@ def draw_dashed_rect(
     draw = ImageDraw.Draw(im)
 
     def dashed_line(p0, p1):
-        x0, y0 = p0
-        x1, y1 = p1
-        dx = x1 - x0
-        dy = y1 - y0
+        xa, ya = p0
+        xb, yb = p1
+        dx = xb - xa
+        dy = yb - ya
         length = max(abs(dx), abs(dy))
         if length == 0:
             return
         for i in range(0, length, dash_len * 2):
             t0 = i / length
             t1 = min(i + dash_len, length) / length
-            sx = x0 + dx * t0
-            sy = y0 + dy * t0
-            ex = x0 + dx * t1
-            ey = y0 + dy * t1
+            sx = xa + dx * t0
+            sy = ya + dy * t0
+            ex = xa + dx * t1
+            ey = ya + dy * t1
             draw.line((sx, sy, ex, ey), fill=color, width=thickness)
 
     dashed_line((x0, y0), (x1, y0))

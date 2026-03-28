@@ -16,7 +16,7 @@ def get_static_cube_positions(env):
     获取不应该被碰撞的静态方块位置。
     包括：
     - extra_green_cubes（堆叠塔中除 cubeB 之外的块）
-    - extra_red_cubes（散落的背景红块）
+    - extra_scattered_cubes（散落的额外方块）
     不包括 cubeB（目标块，红块放上去会有正常的物理交互）。
     """
     unwrapped = env.unwrapped
@@ -28,11 +28,11 @@ def get_static_cube_positions(env):
             p = cube.pose.p
             positions[f"green_{i}"] = np.asarray(p).flatten()[:3].copy()
 
-    # extra_red_cubes（散落的背景红块）
-    if hasattr(unwrapped, "extra_red_cubes"):
-        for i, cube in enumerate(unwrapped.extra_red_cubes):
+    # extra_scattered_cubes（散落的额外方块）
+    if hasattr(unwrapped, "extra_scattered_cubes"):
+        for i, cube in enumerate(unwrapped.extra_scattered_cubes):
             p = cube.pose.p
-            positions[f"red_{i}"] = np.asarray(p).flatten()[:3].copy()
+            positions[f"scattered_{i}"] = np.asarray(p).flatten()[:3].copy()
 
     return positions
 
