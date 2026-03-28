@@ -1,7 +1,8 @@
-from typing import Any, Union
+from typing import Any, List, Union
 
 import numpy as np
 import sapien
+import sapien.render
 import torch
 
 from mani_skill.agents.robots import Fetch, Panda
@@ -19,17 +20,39 @@ from mani_skill.utils.structs.pose import Pose
 class StackCubeEnv(BaseEnv):
     """
     **Task Description:**
-    The goal is to pick up a red cube and stack it on top of a green cube and let go of the cube without it falling
+    Pick up the movable cube (cubeA) and stack it on top of the target cube (cubeB), then release without the stack collapsing.
 
     **Randomizations:**
+    - cubeA / cubeB / stack blocks / scattered extras use distinct random colors each episode
+    - optional scattered cubes (count depends on stack size) so total task cubes (cubeA + stack + scattered) is at most 10
     - both cubes have their z-axis rotation randomized
-    - both cubes have their xy positions on top of the table scene randomized. The positions are sampled such that the cubes do not collide with each other
+    - cube positions on the table are randomized without initial interpenetration
 
     **Success Conditions:**
-    - the red cube is on top of the green cube (to within half of the cube size)
-    - the red cube is static
-    - the red cube is not being grasped by the robot (robot must let go of the cube)
+    - cubeA is on top of cubeB (to within half of the cube size)
+    - cubeA is static
+    - cubeA is not being grasped by the robot
     """
+
+    # cubeA(1) + stack + scattered extras <= _MAX_TASK_CUBES
+    _MAX_TASK_CUBES = 10
+    # 当堆叠只有 1 块时，最多再摆 8 个散落块
+    _MAX_SCATTERED_CUBES = 8
+
+    _CUBE_RGB_PALETTE: List[List[float]] = [
+        [0.90, 0.14, 0.12],
+        [0.12, 0.70, 0.22],
+        [0.15, 0.35, 0.92],
+        [0.95, 0.80, 0.10],
+        [0.75, 0.12, 0.75],
+        [0.10, 0.82, 0.82],
+        [0.95, 0.45, 0.08],
+        [0.45, 0.22, 0.90],
+        [0.55, 0.90, 0.20],
+        [0.92, 0.35, 0.55],
+        [0.25, 0.55, 0.35],
+        [0.55, 0.38, 0.22],
+    ]
 
     _sample_video_link = "https://github.com/haosulab/ManiSkill/raw/main/figures/environment_demos/StackCube-v1_rt.mp4"
     SUPPORTED_ROBOTS = ["panda_wristcam", "panda", "fetch"]
@@ -41,13 +64,11 @@ class StackCubeEnv(BaseEnv):
         robot_uids="panda_wristcam",
         robot_init_qpos_noise=0.02,
         num_distractor_cubes: int = 0,
-        num_extra_red_cubes: int = 0,
         close_camera: bool = False,
         **kwargs,
     ):
         self.robot_init_qpos_noise = robot_init_qpos_noise
         self.num_distractor_cubes = num_distractor_cubes
-        self.num_extra_red_cubes = num_extra_red_cubes  # 额外的红色背景方块数量，默认 0 即仅 1 个红块（cubeA）
         self.distractor_cubes = []
         self.close_camera = close_camera  # 是否使用更近的相机位置
         super().__init__(*args, robot_uids=robot_uids, **kwargs)
@@ -95,7 +116,7 @@ class StackCubeEnv(BaseEnv):
         side = float(self.cube_half_size[0] * 8.0)  # 4 个方块直径 = 8 * half_size
         workspace_half_x = side / 2.0
         workspace_half_y = side / 2.0
-        line_thickness = 0.002
+        line_thickness = 0.004
         line_height = 0.001  # 稍微抬高一点避免与桌面共面导致闪烁
         # 上下两条边（沿 X 方向延伸）
         self.workspace_top_edge = actors.build_box(
@@ -135,60 +156,19 @@ class StackCubeEnv(BaseEnv):
             add_collision=False,
             initial_pose=sapien.Pose(p=[workspace_half_x, 0.0, line_height]),
         )
-        # 任务方块：
-        # - cubeA：红色，可移动的“待摆放积木”（唯一红色目标块）
-        # - cubeB + extra_green_cubes：堆叠在一起的目标积木，每个块一种鲜艳颜色，便于区分
-        if self.num_extra_red_cubes > 0:
-            self.distractor_colors = [
-                [1.0, 0.0, 0.0, 1.0],   # 红
-                [1.0, 0.0, 0.5, 1.0],   # 玫红
-                [0.5, 0.0, 1.0, 1.0],   # 紫蓝
-                [1.0, 0.5, 0.5, 1.0],   # 浅红
-            ]
-            self.cubeA = actors.build_cube(
-                self.scene,
-                half_size=0.02,
-                color=self.distractor_colors[0],
-                name="cubeA",
-                initial_pose=sapien.Pose(p=[0, 0, 0.1]),
-            )
-            self.extra_red_cubes = []
-            for i in range(self.num_extra_red_cubes):
-                cube = actors.build_cube(
-                    self.scene,
-                    half_size=0.02,
-                    color=self.distractor_colors[(i + 1) % len(self.distractor_colors)],
-                    name=f"red_distractor_{i}",
-                    initial_pose=sapien.Pose(p=[0.0, 0.0, -1.0]),
-                )
-                self.extra_red_cubes.append(cube)
-        else:
-            self.cubeA = actors.build_cube(
-                self.scene,
-                half_size=0.02,
-                color=[1.0, 0.0, 0.0, 1.0],  # 红
-                name="cubeA",
-                initial_pose=sapien.Pose(p=[0, 0, 0.1]),
-            )
-            self.extra_red_cubes = []
-
-        # 为堆叠积木准备一组不太浅、互相区分度高的颜色（不包含白色）
-        stack_colors = [
-            [0.0, 0.8, 0.0, 1.0],   # 绿
-            [0.0, 0.4, 1.0, 1.0],   # 蓝
-            [1.0, 0.8, 0.0, 1.0],   # 黄橙
-            [0.8, 0.0, 0.8, 1.0],   # 紫
-            [1.0, 0.4, 0.0, 1.0],   # 橙红
-            [0.0, 0.8, 0.8, 1.0],   # 青
-            [0.6, 0.3, 0.0, 1.0],   # 棕
-            [0.5, 0.0, 0.0, 1.0],   # 深红
-        ]
-
-        # 主目标块 cubeB 使用堆叠颜色中的第一个
+        # 任务方块：具体颜色在 _initialize_episode 中按回合随机指定
+        _placeholder = [0.55, 0.55, 0.55, 1.0]
+        self.cubeA = actors.build_cube(
+            self.scene,
+            half_size=0.02,
+            color=_placeholder,
+            name="cubeA",
+            initial_pose=sapien.Pose(p=[0, 0, 0.1]),
+        )
         self.cubeB = actors.build_cube(
             self.scene,
             half_size=0.02,
-            color=stack_colors[0],
+            color=_placeholder,
             name="cubeB",
             initial_pose=sapien.Pose(p=[1, 0, 0.1]),
         )
@@ -201,11 +181,23 @@ class StackCubeEnv(BaseEnv):
             cube = actors.build_cube(
                 self.scene,
                 half_size=0.02,
-                color=stack_colors[i + 1],
+                color=_placeholder,
                 name=f"cubeB_extra_{i}",
                 initial_pose=sapien.Pose(p=[0.0, 0.0, -1.0]),
             )
             self.extra_green_cubes.append(cube)
+
+        # 散落干扰块（与堆叠无关），每回合随机数量与颜色，预先创建满额
+        self.extra_scattered_cubes = []
+        for i in range(self._MAX_SCATTERED_CUBES):
+            cube = actors.build_cube(
+                self.scene,
+                half_size=0.02,
+                color=_placeholder,
+                name=f"scattered_cube_{i}",
+                initial_pose=sapien.Pose(p=[0.0, 0.0, -1.0]),
+            )
+            self.extra_scattered_cubes.append(cube)
 
         # Optional distractor cubes (non-goal objects) for visual clutter / collisions.
         if self.num_distractor_cubes > 0:
@@ -254,13 +246,76 @@ class StackCubeEnv(BaseEnv):
                 xy_list.append(cubeA_xy[0])
         return torch.stack(xy_list, dim=0)
 
+    @staticmethod
+    def _set_actor_base_color(actor, rgba):
+        """rgba: length-4 列表，每回合更新方块外观。"""
+        for obj in actor._objs:
+            rb = obj.find_component_by_type(sapien.render.RenderBodyComponent)
+            if rb is None:
+                continue
+            for render_shape in rb.render_shapes:
+                for part in render_shape.parts:
+                    part.material.set_base_color(
+                        [float(rgba[0]), float(rgba[1]), float(rgba[2]), float(rgba[3])]
+                    )
+
+    def _sample_distinct_rgba_colors(self, n: int) -> List[List[float]]:
+        palette = np.asarray(self._CUBE_RGB_PALETTE, dtype=np.float64)
+        assert n <= palette.shape[0], "palette too small for requested cube count"
+        idx = self._episode_rng.choice(palette.shape[0], size=n, replace=False)
+        out = []
+        for i in idx:
+            rgb = palette[i]
+            out.append([float(rgb[0]), float(rgb[1]), float(rgb[2]), 1.0])
+        return out
+
+    def _apply_episode_task_colors(self, num_green: int, num_extra_scattered: int):
+        n = 1 + num_green + num_extra_scattered
+        colors = self._sample_distinct_rgba_colors(n)
+        k = 0
+        self._set_actor_base_color(self.cubeA, colors[k])
+        k += 1
+        self._set_actor_base_color(self.cubeB, colors[k])
+        k += 1
+        for i in range(num_green - 1):
+            self._set_actor_base_color(self.extra_green_cubes[i], colors[k])
+            k += 1
+        for i in range(num_extra_scattered):
+            self._set_actor_base_color(self.extra_scattered_cubes[i], colors[k])
+            k += 1
+
     def _initialize_episode(self, env_idx: torch.Tensor, options: dict):
         with torch.device(self.device):
             b = len(env_idx)
             self.table_scene.initialize(env_idx)
 
+            # 先采样堆叠规模与散落块数量，保证 cubeA + 堆叠 + 散落 <= _MAX_TASK_CUBES
+            num_green = torch.randint(
+                low=1,
+                high=self.max_green_cubes + 1,
+                size=(1,),
+                device=self.device,
+            ).item()
+            max_layers = min(3, num_green)
+            num_layers = torch.randint(
+                low=1,
+                high=max_layers + 1,
+                size=(1,),
+                device=self.device,
+            ).item()
+            max_extra = self._MAX_TASK_CUBES - 1 - num_green
+            max_extra = max(0, min(max_extra, self._MAX_SCATTERED_CUBES))
+            re = self._episode_rng
+            if max_extra <= 0:
+                num_extra_scattered = 0
+            elif max_extra == 1:
+                num_extra_scattered = int(re.randint(0, 2))
+            else:
+                low = 2
+                num_extra_scattered = int(re.randint(low, max_extra + 1))
+
             # -------------------------------
-            # 1) 红色方块 cubeA 的初始位置、姿态（桌面上，允许轻微 yaw 偏转）
+            # 1) 待抓取方块 cubeA 的初始位置、姿态（桌面上，允许轻微 yaw 偏转）
             # -------------------------------
             xyz = torch.zeros((b, 3), device=self.device)
             xyz[:, 2] = self.cube_half_size[2]
@@ -291,54 +346,15 @@ class StackCubeEnv(BaseEnv):
             shared_qs[:, 3] = qz
             self.cubeA.set_pose(Pose.create_from_pq(p=xyz.clone(), q=shared_qs))
 
-            # 为额外红块随机选择位置和轻微 yaw（线框外，与堆叠塔和 cubeA 拉开距离）
-            if hasattr(self, "extra_red_cubes") and len(self.extra_red_cubes) > 0:
-                min_dist_from_stack = float(self.cube_half_size[0] * 6.0)
-                min_dist_from_cubeA = float(self.cube_half_size[0] * 4.0)
-                cubeA_xy_np = base_xy[0].cpu().numpy()
-                for cube in self.extra_red_cubes:
-                    for _ in range(64):
-                        xy = (torch.rand(2, device=self.device) * 0.8 - 0.4).cpu().numpy()
-                        dist_stack = np.linalg.norm(xy)
-                        dist_cubeA = np.linalg.norm(xy - cubeA_xy_np)
-                        outside_frame = abs(xy[0]) > frame_half or abs(xy[1]) > frame_half
-                        if outside_frame and dist_stack > min_dist_from_stack and dist_cubeA > min_dist_from_cubeA:
-                            break
-                    p = np.array([xy[0], xy[1], float(self.cube_half_size[2])], dtype=np.float32)
-                    a = (np.random.rand() - 0.5) * (np.pi / 3.0)
-                    qw_r = np.cos(a / 2.0)
-                    qz_r = np.sin(a / 2.0)
-                    q = np.array([qw_r, 0.0, 0.0, qz_r], dtype=np.float32)
-                    pose = Pose.create_from_pq(
-                        p=torch.tensor([p], device=self.device),
-                        q=torch.tensor([q], device=self.device),
-                    )
-                    cube.set_pose(pose)
-
             # -------------------------------
-            # 2) 绿色方块堆叠：总数 1~8 个，1~3 层，姿态对齐且规则栈叠
-            #    - 所有绿色方块（包括 cubeB）共享同一个 yaw，整齐对齐
+            # 2) 堆叠塔（cubeB + extra_green_cubes）：总数 1~8 个，1~3 层，姿态对齐且规则栈叠
+            #    - 堆叠块共享同一个 yaw，整齐对齐
             #    - 采用 2x2 的网格，每一层最多 4 个方块，最多 3 层
             #    - 物理约束：如果第 n+1 层某位置有方块，则第 n 层同位置必须也有方块（不允许“悬空”）
             #    - 目标 cubeB 可以位于任意一层的任意方块上（不再强制选最上层），
-            #      这样红块有时会放在最高层上方，有时会落在已有最高层之下。
+            #      这样待抓取块有时会放在最高层上方，有时会落在已有最高层之下。
             # -------------------------------
-            # 第一步：为当前 episode 采样绿色方块总数和层数（至少 1 个）
-            num_green = torch.randint(
-                low=1,
-                high=self.max_green_cubes + 1,
-                size=(1,),
-                device=self.device,
-            ).item()
-            max_layers = min(3, num_green)
-            num_layers = torch.randint(
-                low=1,
-                high=max_layers + 1,
-                size=(1,),
-                device=self.device,
-            ).item()
-
-            # 为整堆绿色方块使用单位四元数，使所有块与桌面坐标轴完全对齐。
+            # 为整堆方块使用单位四元数，使所有块与桌面坐标轴完全对齐。
             green_q = torch.zeros((1, 4), device=self.device)
             green_q[:, 3] = 1.0
 
@@ -441,10 +457,53 @@ class StackCubeEnv(BaseEnv):
                 cube.set_pose(_slot_to_pose(layer_idx, offset))
 
             # -------------------------------
+            # 2b) 散落额外方块（随机数量；线框外，与堆叠塔和 cubeA 拉开距离）
+            # -------------------------------
+            min_dist_from_stack = float(self.cube_half_size[0] * 6.0)
+            min_dist_from_cubeA = float(self.cube_half_size[0] * 4.0)
+            cubeA_xy_np = base_xy[0].cpu().numpy()
+            hide_sc = Pose.create_from_pq(
+                p=torch.tensor([[0.0, 0.0, -1.0]], device=self.device),
+                q=green_q,
+            )
+            for i, cube in enumerate(self.extra_scattered_cubes):
+                if i < num_extra_scattered:
+                    for _ in range(64):
+                        xy = (torch.rand(2, device=self.device) * 0.8 - 0.4).cpu().numpy()
+                        dist_stack = np.linalg.norm(xy)
+                        dist_cubeA = np.linalg.norm(xy - cubeA_xy_np)
+                        outside_frame = abs(xy[0]) > frame_half or abs(xy[1]) > frame_half
+                        if (
+                            outside_frame
+                            and dist_stack > min_dist_from_stack
+                            and dist_cubeA > min_dist_from_cubeA
+                        ):
+                            break
+                    p = np.array(
+                        [xy[0], xy[1], float(self.cube_half_size[2])],
+                        dtype=np.float32,
+                    )
+                    a = (np.random.rand() - 0.5) * (np.pi / 3.0)
+                    qw_r = np.cos(a / 2.0)
+                    qz_r = np.sin(a / 2.0)
+                    q = np.array([qw_r, 0.0, 0.0, qz_r], dtype=np.float32)
+                    pose = Pose.create_from_pq(
+                        p=torch.tensor([p], device=self.device),
+                        q=torch.tensor([q], device=self.device),
+                    )
+                    cube.set_pose(pose)
+                else:
+                    cube.set_pose(hide_sc)
+
+            self._apply_episode_task_colors(num_green, num_extra_scattered)
+
+            # -------------------------------
             # 3) 干扰方块（保持原本逻辑）
             # -------------------------------
             # Randomize distractor cube poses if enabled.
             if self.num_distractor_cubes > 0 and len(self.distractor_cubes) > 0:
+                cubeA_xy = base_xy
+                cubeB_xy = self.cubeB.pose.p[..., :2]
                 distractor_xy = self._sample_distractor_cube_xy(
                     self.num_distractor_cubes, cubeA_xy, cubeB_xy
                 )
