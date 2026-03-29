@@ -99,11 +99,11 @@ class Args:
     """the frequency of evaluating the agent on the evaluation environments"""
     save_freq: Optional[int] = None
     """the frequency of saving the model checkpoints. By default this is None and will only save checkpoints based on the best evaluation metrics."""
-    num_eval_episodes: int = 20
+    num_eval_episodes: int = 100
     """the number of episodes to evaluate the agent on"""
-    num_eval_envs: int = 10
+    num_eval_envs: int = 100
     """the number of parallel environments to evaluate the agent on"""
-    sim_backend: str = "physx_cpu"
+    sim_backend: str = "gpu"
     """the simulation backend to use for evaluation environments. can be "physx_cpu" or "gpu" """
     num_dataload_workers: int = 0
     """the number of workers to use for loading the training data in the torch dataloader"""
