@@ -477,11 +477,10 @@ if __name__ == "__main__":
     # Sync env-specific params from demo so eval env matches training data
     if demo_info is not None:
         demo_env_kwargs = demo_info.get("env_info", {}).get("env_kwargs", {})
-        for key in ["close_camera", "num_extra_red_cubes", "num_distractor_cubes"]:
+        for key in ["close_camera", "num_distractor_cubes"]:
             if key in demo_env_kwargs:
                 env_kwargs[key] = demo_env_kwargs[key]
         print(f"[env] Synced from demo: close_camera={env_kwargs.get('close_camera')}, "
-              f"num_extra_red_cubes={env_kwargs.get('num_extra_red_cubes')}, "
               f"num_distractor_cubes={env_kwargs.get('num_distractor_cubes')}")
     if args.close_camera:
         env_kwargs["close_camera"] = True
