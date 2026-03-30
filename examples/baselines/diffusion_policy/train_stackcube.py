@@ -61,9 +61,9 @@ class Args:
         "videos/StackCube-v1/stackcube_expert.rgb.pd_ee_delta_pos.physx_cpu.h5"
     )
     """the path of demo dataset, it is expected to be a ManiSkill dataset h5py format file"""
-    num_demos: Optional[int] = None
+    num_demos: Optional[int] = 1000
     """number of trajectories to load from the demo dataset"""
-    total_iters: int = 1_000_000
+    total_iters: int = 500_000
     """total timesteps of the experiment"""
     batch_size: int = 256
     """the batch size of sample from the replay memory"""
@@ -78,12 +78,12 @@ class Args:
     )
     diffusion_step_embed_dim: int = 64  # not very important
     unet_dims: List[int] = field(
-        default_factory=lambda: [64, 128, 256]
+        default_factory=lambda: [128, 256, 512]
     )  # default setting is about ~4.5M params
     n_groups: int = (
         8  # jigu says it is better to let each group have at least 8 channels; it seems 4 and 8 are similar
     )
-    visual_feature_dim: int = 256
+    visual_feature_dim: int = 512
     """output dimension of the visual encoder. Larger values give the UNet more rich visual conditioning."""
     encoder: str = "plainconv"
     """visual encoder type: 'plainconv' or 'resnet18'. resnet18 uses pretrained ImageNet weights."""

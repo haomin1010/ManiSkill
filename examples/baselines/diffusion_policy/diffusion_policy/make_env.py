@@ -6,6 +6,7 @@ import mani_skill.envs
 from mani_skill.utils import gym_utils
 from mani_skill.utils.wrappers import CPUGymWrapper, FrameStack, RecordEpisode
 from mani_skill.vector.wrappers.gymnasium import ManiSkillVectorEnv
+from tqdm import tqdm
 
 def make_eval_envs(
     env_id,
@@ -63,8 +64,13 @@ def make_eval_envs(
             if num_envs == 1
             else lambda x: gym.vector.AsyncVectorEnv(x, context="forkserver")
         )
-        env = vector_cls(
-            [
+        env_fns = []
+        for seed in tqdm(
+            range(num_envs),
+            desc="Preparing eval env factories",
+            leave=False,
+        ):
+            env_fns.append(
                 cpu_make_env(
                     env_id,
                     seed,
@@ -72,17 +78,20 @@ def make_eval_envs(
                     env_kwargs,
                     other_kwargs,
                 )
-                for seed in range(num_envs)
-            ]
-        )
+            )
+        with tqdm(total=1, desc="Initializing vector eval env", leave=False) as pbar:
+            env = vector_cls(env_fns)
+            pbar.update(1)
     else:
-        env = gym.make(
-            env_id,
-            num_envs=num_envs,
-            sim_backend=sim_backend,
-            reconfiguration_freq=1,
-            **env_kwargs
-        )
+        with tqdm(total=1, desc="Creating eval env", leave=False) as pbar:
+            env = gym.make(
+                env_id,
+                num_envs=num_envs,
+                sim_backend=sim_backend,
+                reconfiguration_freq=1,
+                **env_kwargs
+            )
+            pbar.update(1)
         max_episode_steps = gym_utils.find_max_episode_steps_value(env)
         for wrapper in wrappers:
             env = wrapper(env)

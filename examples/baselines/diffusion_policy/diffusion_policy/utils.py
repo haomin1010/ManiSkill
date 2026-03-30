@@ -6,6 +6,7 @@ import torch.nn.functional as F
 from gymnasium import spaces
 from h5py import Dataset, File, Group
 from torch.utils.data.sampler import Sampler
+from tqdm import tqdm
 
 
 class IterationBasedBatchSampler(Sampler):
@@ -90,7 +91,9 @@ def load_traj_hdf5(path, num_traj=None):
         assert num_traj <= len(keys), f"num_traj: {num_traj} > len(keys): {len(keys)}"
         keys = sorted(keys, key=lambda x: int(x.split("_")[-1]))
         keys = keys[:num_traj]
-    ret = {key: load_content_from_h5_file(file[key]) for key in keys}
+    ret = {}
+    for key in tqdm(keys, desc="Loading HDF5 trajectories", leave=False):
+        ret[key] = load_content_from_h5_file(file[key])
     file.close()
     print("Loaded")
     return ret
