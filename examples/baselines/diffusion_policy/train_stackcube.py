@@ -31,6 +31,7 @@ from torch.utils.tensorboard import SummaryWriter
 from diffusion_policy.conditional_unet1d import ConditionalUnet1D
 from diffusion_policy.evaluate import evaluate
 from diffusion_policy.make_env import make_eval_envs
+from diffusion_policy.prompt_wrappers import DynamicStackCubeGoalPromptWrapper
 from diffusion_policy.plain_conv import PlainConv, ResNetEncoder
 from diffusion_policy.utils import (IterationBasedBatchSampler,
                                     build_state_obs_extractor, convert_obs,
@@ -65,7 +66,7 @@ class Args:
         "videos/StackCube-v1/stackcube_expert.rgb.pd_ee_delta_pos.physx_cpu.h5"
     )
     """the path of demo dataset, it is expected to be a ManiSkill dataset h5py format file"""
-    num_demos: Optional[int] = 1000
+    num_demos: Optional[int] = 100
     """number of trajectories to load from the demo dataset"""
     total_iters: int = 500_000
     """total timesteps of the experiment"""
@@ -122,12 +123,14 @@ class Args:
     # visual prompt conditioning (optional)
     use_visual_prompt: bool = True
     """Whether to condition policy on first-frame visual prompt (bbox/center) from prompt JSONs."""
-    prompt_dir: Optional[str] = "videos_new/StackCube-v1/screenshots"
+    prompt_dir: Optional[str] = "videos_new/screenshots"
     """Directory containing ep{idx}_boxes_with_corners.json / ep{idx}_boxes.json files."""
     prompt_embed_dim: int = 64
     """Embedding dimension for visual prompt MLP."""
     prompt_dropout: float = 0.0
     """Dropout probability for prompt vector during training."""
+    save_eval_prompt_viz: bool = False
+    """Whether to save eval-time prompt overlay images for debugging."""
 
 
 def reorder_keys(d, ref_dict):
@@ -722,6 +725,18 @@ if __name__ == "__main__":
     if args.close_camera:
         env_kwargs["close_camera"] = True
     other_kwargs = dict(obs_horizon=args.obs_horizon)
+    eval_wrappers = [FlattenRGBDObservationWrapper]
+    if args.use_visual_prompt:
+        eval_prompt_viz_dir = f"runs/{run_name}/prompt_viz" if args.save_eval_prompt_viz else None
+        eval_wrappers = [
+            FlattenRGBDObservationWrapper,
+            partial(
+                DynamicStackCubeGoalPromptWrapper,
+                output_dir=eval_prompt_viz_dir,
+                save_visualizations=args.save_eval_prompt_viz,
+            ),
+        ]
+
     envs = make_eval_envs(
         args.env_id,
         args.num_eval_envs,
@@ -729,7 +744,7 @@ if __name__ == "__main__":
         env_kwargs,
         other_kwargs,
         video_dir=f"runs/{run_name}/videos" if args.capture_video else None,
-        wrappers=[FlattenRGBDObservationWrapper],
+        wrappers=eval_wrappers,
     )
 
     if args.track:

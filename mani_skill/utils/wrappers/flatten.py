@@ -42,6 +42,7 @@ class FlattenRGBDObservationWrapper(gym.ObservationWrapper):
         self.base_env.update_obs_space(new_obs)
 
     def observation(self, observation: dict):
+        goal_prompt = observation.pop("goal_prompt", None)
         sensor_data = observation.pop("sensor_data")
         del observation["sensor_param"]
         rgb_images = []
@@ -73,6 +74,8 @@ class FlattenRGBDObservationWrapper(gym.ObservationWrapper):
                 ret["rgbd"] = torch.concat([rgb_images, depth_images], axis=-1)
         elif self.include_depth and not self.include_rgb:
             ret["depth"] = depth_images
+        if goal_prompt is not None:
+            ret["goal_prompt"] = goal_prompt
         return ret
 
 

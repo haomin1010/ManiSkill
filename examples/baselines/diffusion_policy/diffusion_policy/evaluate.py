@@ -14,7 +14,12 @@ def evaluate(n: int, agent, eval_envs, device, sim_backend: str, progress_bar: b
         eps_count = 0
         while eps_count < n:
             obs = common.to_tensor(obs, device)
-            action_seq = agent.get_action(obs)
+            goal_prompt = None
+            if isinstance(obs, dict) and "goal_prompt" in obs:
+                goal_prompt = obs["goal_prompt"]
+                if goal_prompt.ndim >= 3:
+                    goal_prompt = goal_prompt[:, -1, :]
+            action_seq = agent.get_action(obs, goal_prompt=goal_prompt)
             if sim_backend == "physx_cpu":
                 action_seq = action_seq.cpu().numpy()
             for i in range(action_seq.shape[1]):
