@@ -32,7 +32,7 @@ class DynamicStackCubeGoalPromptWrapper(gym.Wrapper):
         super().__init__(env)
         self.prompt_cameras = list(prompt_cameras)
         self.box_size_px = float(box_size_px)
-        self.prompt_raw_dim = 8 * len(self.prompt_cameras) + 1
+        self.prompt_raw_dim = 4 * len(self.prompt_cameras) + 1
         self.output_dir = None if output_dir is None else Path(output_dir)
         self.save_visualizations = bool(save_visualizations)
         self._cached_goal_prompt = None
@@ -127,11 +127,7 @@ class DynamicStackCubeGoalPromptWrapper(gym.Wrapper):
             vec[:, write_idx + 1] = (init_center[:, 1] / height).clamp(0.0, 1.0)
             vec[:, write_idx + 2] = (goal_center[:, 0] / width).clamp(0.0, 1.0)
             vec[:, write_idx + 3] = (goal_center[:, 1] / height).clamp(0.0, 1.0)
-            vec[:, write_idx + 4] = self.box_size_px / width
-            vec[:, write_idx + 5] = self.box_size_px / height
-            vec[:, write_idx + 6] = self.box_size_px / width
-            vec[:, write_idx + 7] = self.box_size_px / height
-            write_idx += 8
+            write_idx += 4
 
         vec[:, -1] = 1.0
         return vec

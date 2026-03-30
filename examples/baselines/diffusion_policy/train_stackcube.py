@@ -208,7 +208,7 @@ class SmallDemoDataset_DiffusionPolicy(Dataset):  # Load everything into memory
                         print(f"[prompt-skip] traj_idx={i}, episode_id={prompt_episode_id}: {e}")
                     continue
             else:
-                goal_prompt = torch.zeros(8 * len(PROMPT_CAMERAS) + 1, dtype=torch.float32, device=device)
+                goal_prompt = torch.zeros(4 * len(PROMPT_CAMERAS) + 1, dtype=torch.float32, device=device)
 
             goal_prompt_list.append(goal_prompt)
             kept_actions.append(trajectories["actions"][i])
@@ -367,11 +367,11 @@ class SmallDemoDataset_DiffusionPolicy(Dataset):  # Load everything into memory
         """
         Build a fixed-size prompt vector:
         For each camera in PROMPT_CAMERAS:
-        [init_cx, init_cy, goal_cx, goal_cy, init_w, init_h, goal_w, goal_h]
+        [init_cx, init_cy, goal_cx, goal_cy]
         then append [has_prompt].
         all normalized to [0, 1]. Strict mode: any missing field raises an error.
         """
-        vec = torch.zeros(8 * len(PROMPT_CAMERAS) + 1, dtype=torch.float32, device=device)
+        vec = torch.zeros(4 * len(PROMPT_CAMERAS) + 1, dtype=torch.float32, device=device)
         if prompt_dir is None:
             raise ValueError("prompt_dir must be provided when use_visual_prompt=True")
 
@@ -380,7 +380,6 @@ class SmallDemoDataset_DiffusionPolicy(Dataset):  # Load everything into memory
         cams = data.get("cameras", {})
         if len(cams) == 0:
             raise KeyError(f"No cameras found in prompt json for episode {traj_idx}")
-        box_size = float(data.get("box_size", 32.0))
         write_idx = 0
         for cam_name in PROMPT_CAMERAS:
             cam_data = cams.get(cam_name)
@@ -406,20 +405,11 @@ class SmallDemoDataset_DiffusionPolicy(Dataset):  # Load everything into memory
             if H <= 0 or W <= 0:
                 raise ValueError(f"Invalid image size for prompt camera '{cam_name}': H={H}, W={W}")
 
-            init_w = box_size / W
-            init_h = box_size / H
-            goal_w = box_size / W
-            goal_h = box_size / H
-
             vec[write_idx + 0] = float(init_center[0]) / W
             vec[write_idx + 1] = float(init_center[1]) / H
             vec[write_idx + 2] = float(goal_center[0]) / W
             vec[write_idx + 3] = float(goal_center[1]) / H
-            vec[write_idx + 4] = float(init_w)
-            vec[write_idx + 5] = float(init_h)
-            vec[write_idx + 6] = float(goal_w)
-            vec[write_idx + 7] = float(goal_h)
-            write_idx += 8
+            write_idx += 4
 
         vec[-1] = 1.0
         return vec
@@ -474,7 +464,7 @@ class Agent(nn.Module):
         self.act_horizon = args.act_horizon
         self.pred_horizon = args.pred_horizon
         self.use_visual_prompt = args.use_visual_prompt
-        self.prompt_raw_dim = 8 * len(PROMPT_CAMERAS) + 1
+        self.prompt_raw_dim = 4 * len(PROMPT_CAMERAS) + 1
         assert (
             len(env.single_observation_space["state"].shape) == 2
         )  # (obs_horizon, obs_dim)
