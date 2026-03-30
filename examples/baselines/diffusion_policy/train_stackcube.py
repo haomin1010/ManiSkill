@@ -1,6 +1,7 @@
 ALGO_NAME = "BC_Diffusion_rgb_UNet_StackCube"
 
 import os
+import json
 import random
 import time
 from collections import defaultdict
@@ -34,6 +35,9 @@ from diffusion_policy.plain_conv import PlainConv, ResNetEncoder
 from diffusion_policy.utils import (IterationBasedBatchSampler,
                                     build_state_obs_extractor, convert_obs,
                                     worker_init_fn)
+
+
+PROMPT_CAMERAS = ["base_camera", "left_side_camera", "right_side_camera"]
 
 
 @dataclass
@@ -115,6 +119,16 @@ class Args:
     # additional tags/configs for logging purposes to wandb and shared comparisons with other algorithms
     demo_type: Optional[str] = None
 
+    # visual prompt conditioning (optional)
+    use_visual_prompt: bool = True
+    """Whether to condition policy on first-frame visual prompt (bbox/center) from prompt JSONs."""
+    prompt_dir: Optional[str] = "videos_new/StackCube-v1/screenshots"
+    """Directory containing ep{idx}_boxes_with_corners.json / ep{idx}_boxes.json files."""
+    prompt_embed_dim: int = 64
+    """Embedding dimension for visual prompt MLP."""
+    prompt_dropout: float = 0.0
+    """Dropout probability for prompt vector during training."""
+
 
 def reorder_keys(d, ref_dict):
     out = dict()
@@ -130,6 +144,13 @@ class SmallDemoDataset_DiffusionPolicy(Dataset):  # Load everything into memory
     def __init__(self, data_path, obs_process_fn, obs_space, include_rgb, include_depth, device, num_traj):
         self.include_rgb = include_rgb
         self.include_depth = include_depth
+        self._prompt_json_cache = {}
+        self._prompt_episode_ids = None
+        if args.use_visual_prompt:
+            self._prompt_episode_ids = self._build_prompt_episode_id_map(
+                data_path=data_path,
+                num_traj=num_traj,
+            )
         from diffusion_policy.utils import load_demo_dataset
         trajectories = load_demo_dataset(data_path, num_traj=num_traj, concat=False)
         # trajectories['observations'] is a list of dict, each dict is a traj, with keys in obs_space, values with length L+1
@@ -138,7 +159,15 @@ class SmallDemoDataset_DiffusionPolicy(Dataset):  # Load everything into memory
 
         # Pre-process the observations, make them align with the obs returned by the obs_wrapper
         obs_traj_dict_list = []
-        for obs_traj_dict in trajectories["observations"]:
+        goal_prompt_list = []
+        kept_actions = []
+        skipped_prompt_count = 0
+        total_traj_before_filter = len(trajectories["observations"])
+        for i, obs_traj_dict in enumerate(tqdm(
+            trajectories["observations"],
+            desc="Preprocessing demo observations",
+            leave=False,
+        )):
             _obs_traj_dict = reorder_keys(
                 obs_traj_dict, obs_space
             )  # key order in demo is different from key order in env obs
@@ -155,10 +184,48 @@ class SmallDemoDataset_DiffusionPolicy(Dataset):  # Load everything into memory
                 device
             )
             obs_traj_dict_list.append(_obs_traj_dict)
+
+            # Optional visual prompt (first-frame, third-person camera only)
+            if args.use_visual_prompt:
+                assert self._prompt_episode_ids is not None
+                prompt_episode_id = self._prompt_episode_ids[i]
+                try:
+                    goal_prompt = self._build_goal_prompt_from_files(
+                        traj_idx=i,
+                        prompt_episode_id=prompt_episode_id,
+                        raw_obs_traj_dict=obs_traj_dict,
+                        prompt_dir=args.prompt_dir,
+                        device=device,
+                    )
+                except (FileNotFoundError, KeyError, ValueError) as e:
+                    skipped_prompt_count += 1
+                    # 回退本次 append，跳过该条轨迹，避免 obs/action/prompt 长度错位
+                    obs_traj_dict_list.pop()
+                    if skipped_prompt_count <= 10:
+                        print(f"[prompt-skip] traj_idx={i}, episode_id={prompt_episode_id}: {e}")
+                    continue
+            else:
+                goal_prompt = torch.zeros(8 * len(PROMPT_CAMERAS) + 1, dtype=torch.float32, device=device)
+
+            goal_prompt_list.append(goal_prompt)
+            kept_actions.append(trajectories["actions"][i])
+
         trajectories["observations"] = obs_traj_dict_list
+        trajectories["goal_prompt"] = goal_prompt_list
+        trajectories["actions"] = kept_actions
+        if args.use_visual_prompt and skipped_prompt_count > 0:
+            print(
+                f"[prompt-skip] skipped {skipped_prompt_count}/{total_traj_before_filter} trajectories due to missing/invalid prompt JSON"
+            )
+        if len(trajectories["observations"]) == 0:
+            raise RuntimeError("No trajectories left after prompt filtering. Check prompt_dir and prompt JSON files.")
         self.obs_keys = list(_obs_traj_dict.keys())
         # Pre-process the actions
-        for i in range(len(trajectories["actions"])):
+        for i in tqdm(
+            range(len(trajectories["actions"])),
+            desc="Converting demo actions to tensor",
+            leave=False,
+        ):
             trajectories["actions"][i] = torch.Tensor(trajectories["actions"][i]).to(
                 device=device
             )
@@ -170,7 +237,11 @@ class SmallDemoDataset_DiffusionPolicy(Dataset):  # Load everything into memory
         self.action_min = all_acts.min(dim=0).values  # (act_dim,)
         self.action_max = all_acts.max(dim=0).values  # (act_dim,)
         act_range = (self.action_max - self.action_min).clamp(min=1e-8)
-        for i in range(len(trajectories["actions"])):
+        for i in tqdm(
+            range(len(trajectories["actions"])),
+            desc="Normalizing demo actions",
+            leave=False,
+        ):
             a = trajectories["actions"][i]
             trajectories["actions"][i] = 2.0 * (a - self.action_min) / act_range - 1.0
         print(f"Actions normalized to [-1, 1] using per-DoF min/max from training data.")
@@ -206,7 +277,11 @@ class SmallDemoDataset_DiffusionPolicy(Dataset):  # Load everything into memory
         self.slices = []
         num_traj = len(trajectories["actions"])
         total_transitions = 0
-        for traj_idx in range(num_traj):
+        for traj_idx in tqdm(
+            range(num_traj),
+            desc="Building training sequence indices",
+            leave=False,
+        ):
             L = trajectories["actions"][traj_idx].shape[0]
             assert trajectories["observations"][traj_idx]["state"].shape[0] == L + 1
             total_transitions += L
@@ -230,6 +305,121 @@ class SmallDemoDataset_DiffusionPolicy(Dataset):  # Load everything into memory
         )
 
         self.trajectories = trajectories
+
+    def _build_prompt_episode_id_map(self, data_path: str, num_traj: Optional[int]):
+        """Map traj index -> prompt episode id using sidecar metadata JSON.
+
+        We prefer orig_episode_id (for datasets filtered/reindexed after generation).
+        """
+        if not data_path.endswith(".h5"):
+            raise ValueError(f"Expected .h5 demo path, got: {data_path}")
+        meta_path = data_path[:-2] + "json"
+        if not os.path.exists(meta_path):
+            raise FileNotFoundError(f"Missing metadata json for prompt id mapping: {meta_path}")
+
+        with open(meta_path, "r") as f:
+            meta = json.load(f)
+
+        episodes = meta.get("episodes", [])
+        if num_traj is not None:
+            episodes = episodes[:num_traj]
+
+        if len(episodes) == 0:
+            raise ValueError("No episodes found in metadata json for prompt mapping")
+
+        ids = []
+        for i, ep in enumerate(episodes):
+            if "orig_episode_id" in ep:
+                ids.append(int(ep["orig_episode_id"]))
+            elif "episode_id" in ep:
+                ids.append(int(ep["episode_id"]))
+            else:
+                raise KeyError(f"Episode {i} missing both orig_episode_id and episode_id")
+        return ids
+
+    def _load_episode_prompt_json(self, prompt_dir: str, ep_idx: int):
+        if prompt_dir is None:
+            raise ValueError("prompt_dir must be provided when use_visual_prompt=True")
+        if ep_idx in self._prompt_json_cache:
+            return self._prompt_json_cache[ep_idx]
+
+        p = os.path.join(prompt_dir, f"ep{ep_idx}_boxes.json")
+        if not os.path.exists(p):
+            raise FileNotFoundError(
+                f"Missing visual prompt file for episode {ep_idx}: {p}"
+            )
+        with open(p, "r") as f:
+            data = json.load(f)
+        self._prompt_json_cache[ep_idx] = data
+        return data
+
+    def _build_goal_prompt_from_files(
+        self,
+        traj_idx: int,
+        prompt_episode_id: int,
+        raw_obs_traj_dict: dict,
+        prompt_dir: Optional[str],
+        device,
+    ):
+        """
+        Build a fixed-size prompt vector:
+        For each camera in PROMPT_CAMERAS:
+        [init_cx, init_cy, goal_cx, goal_cy, init_w, init_h, goal_w, goal_h]
+        then append [has_prompt].
+        all normalized to [0, 1]. Strict mode: any missing field raises an error.
+        """
+        vec = torch.zeros(8 * len(PROMPT_CAMERAS) + 1, dtype=torch.float32, device=device)
+        if prompt_dir is None:
+            raise ValueError("prompt_dir must be provided when use_visual_prompt=True")
+
+        data = self._load_episode_prompt_json(prompt_dir, prompt_episode_id)
+
+        cams = data.get("cameras", {})
+        if len(cams) == 0:
+            raise KeyError(f"No cameras found in prompt json for episode {traj_idx}")
+        box_size = float(data.get("box_size", 32.0))
+        write_idx = 0
+        for cam_name in PROMPT_CAMERAS:
+            cam_data = cams.get(cam_name)
+            if cam_data is None:
+                raise KeyError(
+                    f"Camera '{cam_name}' not found in prompt json for episode {prompt_episode_id} (traj_idx={traj_idx}). "
+                    f"Available cameras: {list(cams.keys())}"
+                )
+
+            init_center = cam_data.get("init_center_px")
+            goal_center = cam_data.get("goal_center_px")
+            if init_center is None and isinstance(cam_data.get("init_box_corners"), dict):
+                init_center = cam_data["init_box_corners"].get("center")
+            if goal_center is None and isinstance(cam_data.get("goal_box_corners"), dict):
+                goal_center = cam_data["goal_box_corners"].get("center")
+            if init_center is None or goal_center is None:
+                raise KeyError(
+                    f"Missing init/goal center for episode {prompt_episode_id} (traj_idx={traj_idx}), camera '{cam_name}'"
+                )
+
+            rgb = raw_obs_traj_dict["sensor_data"][cam_name]["rgb"]
+            H, W = rgb.shape[1], rgb.shape[2]  # rgb: (T, H, W, C)
+            if H <= 0 or W <= 0:
+                raise ValueError(f"Invalid image size for prompt camera '{cam_name}': H={H}, W={W}")
+
+            init_w = box_size / W
+            init_h = box_size / H
+            goal_w = box_size / W
+            goal_h = box_size / H
+
+            vec[write_idx + 0] = float(init_center[0]) / W
+            vec[write_idx + 1] = float(init_center[1]) / H
+            vec[write_idx + 2] = float(goal_center[0]) / W
+            vec[write_idx + 3] = float(goal_center[1]) / H
+            vec[write_idx + 4] = float(init_w)
+            vec[write_idx + 5] = float(init_h)
+            vec[write_idx + 6] = float(goal_w)
+            vec[write_idx + 7] = float(goal_h)
+            write_idx += 8
+
+        vec[-1] = 1.0
+        return vec
 
     def __getitem__(self, index):
         traj_idx, start, end = self.slices[index]
@@ -266,6 +456,7 @@ class SmallDemoDataset_DiffusionPolicy(Dataset):  # Load everything into memory
         return {
             "observations": obs_seq,
             "actions": act_seq,
+            "goal_prompt": self.trajectories["goal_prompt"][traj_idx],
         }
 
     def __len__(self):
@@ -275,9 +466,12 @@ class SmallDemoDataset_DiffusionPolicy(Dataset):  # Load everything into memory
 class Agent(nn.Module):
     def __init__(self, env: VectorEnv, args: Args):
         super().__init__()
+        self.args = args
         self.obs_horizon = args.obs_horizon
         self.act_horizon = args.act_horizon
         self.pred_horizon = args.pred_horizon
+        self.use_visual_prompt = args.use_visual_prompt
+        self.prompt_raw_dim = 8 * len(PROMPT_CAMERAS) + 1
         assert (
             len(env.single_observation_space["state"].shape) == 2
         )  # (obs_horizon, obs_dim)
@@ -314,9 +508,17 @@ class Agent(nn.Module):
             )
             print(f"[encoder] Using PlainConv encoder (in_channels={total_visual_channels}, out_dim={visual_feature_dim})")
 
+        prompt_cond_dim = args.prompt_embed_dim if self.use_visual_prompt else 0
+        if self.use_visual_prompt:
+            self.prompt_encoder = nn.Sequential(
+                nn.Linear(self.prompt_raw_dim, 128),
+                nn.ReLU(inplace=True),
+                nn.Linear(128, args.prompt_embed_dim),
+            )
+
         self.noise_pred_net = ConditionalUnet1D(
             input_dim=self.act_dim,  # act_horizon is not used (U-Net doesn't care)
-            global_cond_dim=self.obs_horizon * (visual_feature_dim + obs_state_dim),
+            global_cond_dim=self.obs_horizon * (visual_feature_dim + obs_state_dim) + prompt_cond_dim,
             diffusion_step_embed_dim=args.diffusion_step_embed_dim,
             down_dims=args.unet_dims,
             n_groups=args.n_groups,
@@ -329,7 +531,7 @@ class Agent(nn.Module):
             prediction_type="epsilon",  # predict noise (instead of denoised action)
         )
 
-    def encode_obs(self, obs_seq, eval_mode):
+    def encode_obs(self, obs_seq, eval_mode, goal_prompt=None):
         if self.include_rgb:
             rgb = obs_seq["rgb"].float() / 255.0  # (B, obs_horizon, 3*k, H, W)
             img_seq = rgb
@@ -349,14 +551,38 @@ class Agent(nn.Module):
         feature = torch.cat(
             (visual_feature, obs_seq["state"]), dim=-1
         )  # (B, obs_horizon, D+obs_state_dim)
-        return feature.flatten(start_dim=1)  # (B, obs_horizon * (D+obs_state_dim))
+        obs_cond = feature.flatten(start_dim=1)  # (B, obs_horizon * (D+obs_state_dim))
 
-    def compute_loss(self, obs_seq, action_seq):
+        if not self.use_visual_prompt:
+            return obs_cond
+
+        if goal_prompt is None:
+            goal_prompt = torch.zeros(
+                (batch_size, self.prompt_raw_dim),
+                dtype=obs_cond.dtype,
+                device=obs_cond.device,
+            )
+        else:
+            if goal_prompt.ndim == 1:
+                goal_prompt = goal_prompt.unsqueeze(0)
+            goal_prompt = goal_prompt.to(device=obs_cond.device, dtype=obs_cond.dtype)
+
+        if (not eval_mode) and self.args.prompt_dropout > 0:
+            keep_mask = (
+                torch.rand((batch_size, 1), device=obs_cond.device)
+                > self.args.prompt_dropout
+            ).to(obs_cond.dtype)
+            goal_prompt = goal_prompt * keep_mask
+
+        prompt_cond = self.prompt_encoder(goal_prompt)
+        return torch.cat([obs_cond, prompt_cond], dim=-1)
+
+    def compute_loss(self, obs_seq, action_seq, goal_prompt=None):
         B = obs_seq["state"].shape[0]
 
         # observation as FiLM conditioning
         obs_cond = self.encode_obs(
-            obs_seq, eval_mode=False
+            obs_seq, eval_mode=False, goal_prompt=goal_prompt
         )  # (B, obs_horizon * obs_dim)
 
         # sample noise to add to actions
@@ -378,7 +604,7 @@ class Agent(nn.Module):
 
         return F.mse_loss(noise_pred, noise)
 
-    def get_action(self, obs_seq):
+    def get_action(self, obs_seq, goal_prompt=None):
         # obs_seq['state']: (B, obs_horizon, obs_state_dim)
         B = obs_seq["state"].shape[0]
         with torch.no_grad():
@@ -388,7 +614,7 @@ class Agent(nn.Module):
                 obs_seq["depth"] = obs_seq["depth"].permute(0, 1, 4, 2, 3)
 
             obs_cond = self.encode_obs(
-                obs_seq, eval_mode=True
+                obs_seq, eval_mode=True, goal_prompt=goal_prompt
             )  # (B, obs_horizon * obs_dim)
 
             # initialize action from Gaussian noise
@@ -436,6 +662,9 @@ def save_ckpt(run_name, tag):
 
 if __name__ == "__main__":
     args = tyro.cli(Args)
+
+    if args.use_visual_prompt and not args.prompt_dir:
+        raise ValueError("--use-visual-prompt requires --prompt-dir (strict mode, no fallback)")
 
     if args.exp_name is None:
         args.exp_name = os.path.basename(__file__)[: -len(".py")]
@@ -638,6 +867,7 @@ if __name__ == "__main__":
         total_loss = agent.compute_loss(
             obs_seq=data_batch["observations"],  # (B, obs_horizon, ...)
             action_seq=data_batch["actions"],  # (B, pred_horizon, act_dim)
+            goal_prompt=data_batch.get("goal_prompt"),
         )
         timings["forward"] += time.time() - last_tick
 
