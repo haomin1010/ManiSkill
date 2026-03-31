@@ -11,6 +11,7 @@ from gymnasium.vector.utils import batch_space
 
 
 DEFAULT_PROMPT_CAMERAS = ["base_camera", "left_side_camera", "right_side_camera"]
+PROMPT_BOX_DIM_PER_CAMERA = 8
 
 
 class DynamicStackCubeGoalPromptWrapper(gym.Wrapper):
@@ -32,7 +33,7 @@ class DynamicStackCubeGoalPromptWrapper(gym.Wrapper):
         super().__init__(env)
         self.prompt_cameras = list(prompt_cameras)
         self.box_size_px = float(box_size_px)
-        self.prompt_raw_dim = 4 * len(self.prompt_cameras) + 1
+        self.prompt_raw_dim = PROMPT_BOX_DIM_PER_CAMERA * len(self.prompt_cameras) + 1
         self.output_dir = None if output_dir is None else Path(output_dir)
         self.save_visualizations = bool(save_visualizations)
         self._cached_goal_prompt = None
@@ -122,15 +123,27 @@ class DynamicStackCubeGoalPromptWrapper(gym.Wrapper):
 
             init_center = self._project_world_points(cubeA_pos, intrinsic, extrinsic)
             goal_center = self._project_world_points(goal_pos, intrinsic, extrinsic)
+            init_box = self._center_to_box_xyxy(init_center)
+            goal_box = self._center_to_box_xyxy(goal_center)
 
-            vec[:, write_idx + 0] = (init_center[:, 0] / width).clamp(0.0, 1.0)
-            vec[:, write_idx + 1] = (init_center[:, 1] / height).clamp(0.0, 1.0)
-            vec[:, write_idx + 2] = (goal_center[:, 0] / width).clamp(0.0, 1.0)
-            vec[:, write_idx + 3] = (goal_center[:, 1] / height).clamp(0.0, 1.0)
-            write_idx += 4
+            vec[:, write_idx + 0] = (init_box[:, 0] / width).clamp(0.0, 1.0)
+            vec[:, write_idx + 1] = (init_box[:, 1] / height).clamp(0.0, 1.0)
+            vec[:, write_idx + 2] = (init_box[:, 2] / width).clamp(0.0, 1.0)
+            vec[:, write_idx + 3] = (init_box[:, 3] / height).clamp(0.0, 1.0)
+            vec[:, write_idx + 4] = (goal_box[:, 0] / width).clamp(0.0, 1.0)
+            vec[:, write_idx + 5] = (goal_box[:, 1] / height).clamp(0.0, 1.0)
+            vec[:, write_idx + 6] = (goal_box[:, 2] / width).clamp(0.0, 1.0)
+            vec[:, write_idx + 7] = (goal_box[:, 3] / height).clamp(0.0, 1.0)
+            write_idx += PROMPT_BOX_DIM_PER_CAMERA
 
         vec[:, -1] = 1.0
         return vec
+
+    def _center_to_box_xyxy(self, center: torch.Tensor) -> torch.Tensor:
+        half_box = self.box_size_px / 2.0
+        x = center[:, 0]
+        y = center[:, 1]
+        return torch.stack([x - half_box, y - half_box, x + half_box, y + half_box], dim=-1)
 
     def _save_prompt_visualizations(self, observation: dict) -> None:
         if self.output_dir is None:
@@ -169,7 +182,9 @@ class DynamicStackCubeGoalPromptWrapper(gym.Wrapper):
                     intrinsic[env_idx : env_idx + 1],
                     extrinsic[env_idx : env_idx + 1],
                 )[0]
-                self._draw_prompt(canvas, init_center, goal_center)
+                init_box = self._center_to_box_xyxy(init_center.unsqueeze(0))[0]
+                goal_box = self._center_to_box_xyxy(goal_center.unsqueeze(0))[0]
+                self._draw_prompt(canvas, init_box, goal_box)
                 stem = f"pid{os.getpid()}_ep{self._episode_counter:04d}_env{env_idx:02d}_{cam_name}"
                 cv2.imwrite(str(self.output_dir / f"{stem}.png"), canvas)
 
@@ -219,22 +234,29 @@ class DynamicStackCubeGoalPromptWrapper(gym.Wrapper):
             frames[cam_name] = cam_rgb
         return frames
 
-    def _draw_prompt(self, canvas: np.ndarray, init_center: torch.Tensor, goal_center: torch.Tensor) -> None:
-        init_xy = tuple(int(round(v)) for v in init_center.detach().cpu().tolist())
-        goal_xy = tuple(int(round(v)) for v in goal_center.detach().cpu().tolist())
-        half_box = int(round(self.box_size_px / 2.0))
+    def _draw_prompt(self, canvas: np.ndarray, init_box: torch.Tensor, goal_box: torch.Tensor) -> None:
+        init_box_xyxy = [int(round(v)) for v in init_box.detach().cpu().tolist()]
+        goal_box_xyxy = [int(round(v)) for v in goal_box.detach().cpu().tolist()]
+        init_xy = (
+            int(round((init_box_xyxy[0] + init_box_xyxy[2]) / 2.0)),
+            int(round((init_box_xyxy[1] + init_box_xyxy[3]) / 2.0)),
+        )
+        goal_xy = (
+            int(round((goal_box_xyxy[0] + goal_box_xyxy[2]) / 2.0)),
+            int(round((goal_box_xyxy[1] + goal_box_xyxy[3]) / 2.0)),
+        )
 
         cv2.rectangle(
             canvas,
-            (init_xy[0] - half_box, init_xy[1] - half_box),
-            (init_xy[0] + half_box, init_xy[1] + half_box),
+            (init_box_xyxy[0], init_box_xyxy[1]),
+            (init_box_xyxy[2], init_box_xyxy[3]),
             (0, 255, 255),
             2,
         )
         cv2.rectangle(
             canvas,
-            (goal_xy[0] - half_box, goal_xy[1] - half_box),
-            (goal_xy[0] + half_box, goal_xy[1] + half_box),
+            (goal_box_xyxy[0], goal_box_xyxy[1]),
+            (goal_box_xyxy[2], goal_box_xyxy[3]),
             (0, 0, 255),
             2,
         )

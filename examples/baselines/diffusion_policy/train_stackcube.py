@@ -39,6 +39,54 @@ from diffusion_policy.utils import (IterationBasedBatchSampler,
 
 
 PROMPT_CAMERAS = ["base_camera", "left_side_camera", "right_side_camera"]
+PROMPT_BOX_DIM_PER_CAMERA = 8
+PROMPT_RAW_DIM = PROMPT_BOX_DIM_PER_CAMERA * len(PROMPT_CAMERAS) + 1
+PROMPT_BOX_SIZE_PX = 32.0
+
+
+def prompt_raw_dim() -> int:
+    return 8 * len(PROMPT_CAMERAS) + 1
+
+
+def _xyxy_from_corners(corners: dict):
+    top_left = corners.get("top_left")
+    bottom_right = corners.get("bottom_right")
+    if top_left is None or bottom_right is None:
+        return None
+    return [
+        float(top_left[0]),
+        float(top_left[1]),
+        float(bottom_right[0]),
+        float(bottom_right[1]),
+    ]
+
+
+def _xyxy_from_center(center, box_size_px: float = PROMPT_BOX_SIZE_PX):
+    if center is None:
+        return None
+    half_box = float(box_size_px) / 2.0
+    cx = float(center[0])
+    cy = float(center[1])
+    return [cx - half_box, cy - half_box, cx + half_box, cy + half_box]
+
+
+def _extract_prompt_box_xyxy(cam_data: dict, prefix: str):
+    box_key = f"{prefix}_box"
+    if isinstance(cam_data.get(box_key), (list, tuple)) and len(cam_data[box_key]) == 4:
+        return [float(v) for v in cam_data[box_key]]
+
+    corners_key = f"{prefix}_box_corners"
+    if isinstance(cam_data.get(corners_key), dict):
+        xyxy = _xyxy_from_corners(cam_data[corners_key])
+        if xyxy is not None:
+            return xyxy
+        center = cam_data[corners_key].get("center")
+        xyxy = _xyxy_from_center(center)
+        if xyxy is not None:
+            return xyxy
+
+    center_key = f"{prefix}_center_px"
+    return _xyxy_from_center(cam_data.get(center_key))
 
 
 @dataclass
@@ -90,7 +138,7 @@ class Args:
     )
     visual_feature_dim: int = 512
     """output dimension of the visual encoder. Larger values give the UNet more rich visual conditioning."""
-    encoder: str = "plainconv"
+    encoder: str = "resnet18"
     """visual encoder type: 'plainconv' or 'resnet18'. resnet18 uses pretrained ImageNet weights."""
 
     # Environment/experiment specific arguments
@@ -218,7 +266,7 @@ class SmallDemoDataset_DiffusionPolicy(Dataset):  # Load everything into memory
                         print(f"[prompt-skip] traj_idx={i}, episode_id={prompt_episode_id}: {e}")
                     continue
             else:
-                goal_prompt = torch.zeros(4 * len(PROMPT_CAMERAS) + 1, dtype=torch.float32, device=device)
+                goal_prompt = torch.zeros(prompt_raw_dim(), dtype=torch.float32, device=device)
 
             goal_prompt_list.append(goal_prompt)
             kept_actions.append(trajectories["actions"][i])
@@ -356,10 +404,14 @@ class SmallDemoDataset_DiffusionPolicy(Dataset):  # Load everything into memory
         if ep_idx in self._prompt_json_cache:
             return self._prompt_json_cache[ep_idx]
 
-        p = os.path.join(prompt_dir, f"ep{ep_idx}_boxes.json")
-        if not os.path.exists(p):
+        candidates = [
+            os.path.join(prompt_dir, f"ep{ep_idx}_boxes_with_corners.json"),
+            os.path.join(prompt_dir, f"ep{ep_idx}_boxes.json"),
+        ]
+        p = next((candidate for candidate in candidates if os.path.exists(candidate)), None)
+        if p is None:
             raise FileNotFoundError(
-                f"Missing visual prompt file for episode {ep_idx}: {p}"
+                f"Missing visual prompt file for episode {ep_idx}. Checked: {candidates}"
             )
         with open(p, "r") as f:
             data = json.load(f)
@@ -377,11 +429,11 @@ class SmallDemoDataset_DiffusionPolicy(Dataset):  # Load everything into memory
         """
         Build a fixed-size prompt vector:
         For each camera in PROMPT_CAMERAS:
-        [init_cx, init_cy, goal_cx, goal_cy]
+        [init_x1, init_y1, init_x2, init_y2, goal_x1, goal_y1, goal_x2, goal_y2]
         then append [has_prompt].
         all normalized to [0, 1]. Strict mode: any missing field raises an error.
         """
-        vec = torch.zeros(4 * len(PROMPT_CAMERAS) + 1, dtype=torch.float32, device=device)
+        vec = torch.zeros(prompt_raw_dim(), dtype=torch.float32, device=device)
         if prompt_dir is None:
             raise ValueError("prompt_dir must be provided when use_visual_prompt=True")
 
@@ -399,15 +451,11 @@ class SmallDemoDataset_DiffusionPolicy(Dataset):  # Load everything into memory
                     f"Available cameras: {list(cams.keys())}"
                 )
 
-            init_center = cam_data.get("init_center_px")
-            goal_center = cam_data.get("goal_center_px")
-            if init_center is None and isinstance(cam_data.get("init_box_corners"), dict):
-                init_center = cam_data["init_box_corners"].get("center")
-            if goal_center is None and isinstance(cam_data.get("goal_box_corners"), dict):
-                goal_center = cam_data["goal_box_corners"].get("center")
-            if init_center is None or goal_center is None:
+            init_box = _extract_prompt_box_xyxy(cam_data, "init")
+            goal_box = _extract_prompt_box_xyxy(cam_data, "goal")
+            if init_box is None or goal_box is None:
                 raise KeyError(
-                    f"Missing init/goal center for episode {prompt_episode_id} (traj_idx={traj_idx}), camera '{cam_name}'"
+                    f"Missing init/goal box for episode {prompt_episode_id} (traj_idx={traj_idx}), camera '{cam_name}'"
                 )
 
             rgb = raw_obs_traj_dict["sensor_data"][cam_name]["rgb"]
@@ -415,11 +463,22 @@ class SmallDemoDataset_DiffusionPolicy(Dataset):  # Load everything into memory
             if H <= 0 or W <= 0:
                 raise ValueError(f"Invalid image size for prompt camera '{cam_name}': H={H}, W={W}")
 
-            vec[write_idx + 0] = float(init_center[0]) / W
-            vec[write_idx + 1] = float(init_center[1]) / H
-            vec[write_idx + 2] = float(goal_center[0]) / W
-            vec[write_idx + 3] = float(goal_center[1]) / H
-            write_idx += 4
+            init_box = [
+                min(max(float(init_box[0]) / W, 0.0), 1.0),
+                min(max(float(init_box[1]) / H, 0.0), 1.0),
+                min(max(float(init_box[2]) / W, 0.0), 1.0),
+                min(max(float(init_box[3]) / H, 0.0), 1.0),
+            ]
+            goal_box = [
+                min(max(float(goal_box[0]) / W, 0.0), 1.0),
+                min(max(float(goal_box[1]) / H, 0.0), 1.0),
+                min(max(float(goal_box[2]) / W, 0.0), 1.0),
+                min(max(float(goal_box[3]) / H, 0.0), 1.0),
+            ]
+
+            values = init_box + goal_box
+            vec[write_idx : write_idx + 8] = torch.tensor(values, dtype=torch.float32, device=device)
+            write_idx += 8
 
         vec[-1] = 1.0
         return vec
@@ -474,7 +533,7 @@ class Agent(nn.Module):
         self.act_horizon = args.act_horizon
         self.pred_horizon = args.pred_horizon
         self.use_visual_prompt = args.use_visual_prompt
-        self.prompt_raw_dim = 4 * len(PROMPT_CAMERAS) + 1
+        self.prompt_raw_dim = prompt_raw_dim()
         assert (
             len(env.single_observation_space["state"].shape) == 2
         )  # (obs_horizon, obs_dim)
@@ -737,6 +796,7 @@ if __name__ == "__main__":
             ),
         ]
 
+    eval_base_seed = int(time.time())
     envs = make_eval_envs(
         args.env_id,
         args.num_eval_envs,
@@ -745,6 +805,7 @@ if __name__ == "__main__":
         other_kwargs,
         video_dir=f"runs/{run_name}/videos" if args.capture_video else None,
         wrappers=eval_wrappers,
+        base_seed=eval_base_seed,
     )
 
     if args.track:

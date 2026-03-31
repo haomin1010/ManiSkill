@@ -16,6 +16,7 @@ def make_eval_envs(
     other_kwargs: dict,
     video_dir: Optional[str] = None,
     wrappers: list[gym.Wrapper] = [],
+    base_seed: int = 0,
 ):
     """Create vectorized environment for evaluation and/or recording videos.
     For CPU vectorized environments only the first parallel environment is used to record videos.
@@ -66,7 +67,7 @@ def make_eval_envs(
         )
         env_fns = []
         for seed in tqdm(
-            range(num_envs),
+            range(base_seed, base_seed + num_envs),
             desc="Preparing eval env factories",
             leave=False,
         ):
@@ -83,6 +84,8 @@ def make_eval_envs(
             env = vector_cls(env_fns)
             pbar.update(1)
     else:
+        np.random.seed(base_seed)
+        torch.manual_seed(base_seed)
         with tqdm(total=1, desc="Creating eval env", leave=False) as pbar:
             env = gym.make(
                 env_id,
@@ -92,6 +95,10 @@ def make_eval_envs(
                 **env_kwargs
             )
             pbar.update(1)
+        if hasattr(env, "action_space"):
+            env.action_space.seed(base_seed)
+        if hasattr(env, "observation_space"):
+            env.observation_space.seed(base_seed)
         max_episode_steps = gym_utils.find_max_episode_steps_value(env)
         for wrapper in wrappers:
             env = wrapper(env)
