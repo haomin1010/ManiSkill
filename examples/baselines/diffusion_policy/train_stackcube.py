@@ -114,7 +114,7 @@ class Args:
     """the number of workers to use for loading the training data in the torch dataloader"""
     control_mode: str = "pd_ee_delta_pos"
     """the control mode to use for the evaluation environments. Must match the control mode of the demonstration dataset."""
-    close_camera: bool = False
+    close_camera: bool = True
     """Use closer camera view (e.g. for StackCube). Must match the camera config used when recording demonstrations."""
 
     # additional tags/configs for logging purposes to wandb and shared comparisons with other algorithms
@@ -141,6 +141,16 @@ def reorder_keys(d, ref_dict):
         else:
             out[k] = d[k]
     return out
+
+
+def encode_rgb_for_storage(rgb: torch.Tensor) -> torch.Tensor:
+    return rgb.to(torch.int16).sub_(128).to(torch.int8)
+
+
+def decode_rgb_for_encoder(rgb: torch.Tensor) -> torch.Tensor:
+    if rgb.dtype == torch.int8:
+        return rgb.to(torch.int16).add_(128).to(torch.float32) / 255.0
+    return rgb.to(torch.float32) / 255.0
 
 
 class SmallDemoDataset_DiffusionPolicy(Dataset):  # Load everything into memory
@@ -180,9 +190,9 @@ class SmallDemoDataset_DiffusionPolicy(Dataset):  # Load everything into memory
                     _obs_traj_dict["depth"].astype(np.float32)
                 ).to(device=device, dtype=torch.float16)
             if self.include_rgb:
-                _obs_traj_dict["rgb"] = torch.from_numpy(_obs_traj_dict["rgb"]).to(
-                    device
-                )  # still uint8
+                _obs_traj_dict["rgb"] = encode_rgb_for_storage(
+                    torch.from_numpy(_obs_traj_dict["rgb"])
+                ).to(device)
             _obs_traj_dict["state"] = torch.from_numpy(_obs_traj_dict["state"]).to(
                 device
             )
@@ -526,7 +536,7 @@ class Agent(nn.Module):
 
     def encode_obs(self, obs_seq, eval_mode, goal_prompt=None):
         if self.include_rgb:
-            rgb = obs_seq["rgb"].float() / 255.0  # (B, obs_horizon, 3*k, H, W)
+            rgb = decode_rgb_for_encoder(obs_seq["rgb"])  # (B, obs_horizon, 3*k, H, W)
             img_seq = rgb
         if self.include_depth:
             depth = obs_seq["depth"].float() / 1024.0  # (B, obs_horizon, 1*k, H, W)
@@ -700,7 +710,7 @@ if __name__ == "__main__":
         obs_mode=args.obs_mode,
         render_mode="rgb_array",
         human_render_camera_configs=dict(shader_pack="default"),
-        sensor_configs=dict(width=128, height=128),
+        sensor_configs=dict(width=512, height=512),
     )
     assert args.max_episode_steps is not None, "max_episode_steps must be specified as imitation learning algorithms task solve speed is dependent on the data you train on"
     env_kwargs["max_episode_steps"] = args.max_episode_steps
