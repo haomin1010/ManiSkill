@@ -50,6 +50,7 @@ def make_eval_envs(
                         env,
                         output_dir=video_dir,
                         save_trajectory=False,
+                        save_video=True,
                         info_on_video=True,
                         source_type="diffusion_policy",
                         source_desc="diffusion_policy evaluation rollout",

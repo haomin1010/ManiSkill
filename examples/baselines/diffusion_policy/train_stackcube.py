@@ -148,11 +148,11 @@ class Args:
     """Override environment max_episode_steps. Set to 300 to exceed the longest demo (~231 steps)."""
     log_freq: int = 1000
     """the frequency of logging the training metrics"""
-    eval_freq: int = 5000
+    eval_freq: int = 1000
     """the frequency of evaluating the agent on the evaluation environments"""
     save_freq: Optional[int] = None
     """the frequency of saving the model checkpoints. By default this is None and will only save checkpoints based on the best evaluation metrics."""
-    num_eval_episodes: int = 100
+    num_eval_episodes: int = 20
     """the number of episodes to evaluate the agent on"""
     num_eval_envs: int = 10
     """the number of parallel environments to evaluate the agent on"""
@@ -162,7 +162,7 @@ class Args:
     """the number of workers to use for loading the training data in the torch dataloader"""
     control_mode: str = "pd_ee_delta_pos"
     """the control mode to use for the evaluation environments. Must match the control mode of the demonstration dataset."""
-    close_camera: bool = True
+    close_camera: bool = False
     """Use closer camera view (e.g. for StackCube). Must match the camera config used when recording demonstrations."""
 
     # additional tags/configs for logging purposes to wandb and shared comparisons with other algorithms
@@ -710,15 +710,15 @@ class Agent(nn.Module):
         return actions  # (B, act_horizon, act_dim)
 
 
-def save_ckpt(run_name, tag):
-    os.makedirs(f"runs/{run_name}/checkpoints", exist_ok=True)
+def save_ckpt(run_dir, tag):
+    os.makedirs(os.path.join(run_dir, "checkpoints"), exist_ok=True)
     ema.copy_to(ema_agent.parameters())
     torch.save(
         {
             "agent": agent.state_dict(),
             "ema_agent": ema_agent.state_dict(),
         },
-        f"runs/{run_name}/checkpoints/{tag}.pt",
+        os.path.join(run_dir, "checkpoints", f"{tag}.pt"),
     )
 
 
@@ -730,9 +730,12 @@ if __name__ == "__main__":
 
     if args.exp_name is None:
         args.exp_name = os.path.basename(__file__)[: -len(".py")]
-        run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
+        run_name = f"{args.env_id}__{args.exp_name}__{args.encoder}__{args.seed}__{int(time.time())}"
     else:
         run_name = args.exp_name
+
+    run_dir = os.path.join("runs", run_name)
+    os.makedirs(run_dir, exist_ok=True)
 
     demo_info = None
     if args.demo_path.endswith(".h5"):
@@ -786,7 +789,7 @@ if __name__ == "__main__":
     other_kwargs = dict(obs_horizon=args.obs_horizon)
     eval_wrappers = [FlattenRGBDObservationWrapper]
     if args.use_visual_prompt:
-        eval_prompt_viz_dir = f"runs/{run_name}/prompt_viz" if args.save_eval_prompt_viz else None
+        eval_prompt_viz_dir = os.path.join(run_dir, "prompt_viz") if args.save_eval_prompt_viz else None
         eval_wrappers = [
             FlattenRGBDObservationWrapper,
             partial(
@@ -796,17 +799,7 @@ if __name__ == "__main__":
             ),
         ]
 
-    eval_base_seed = int(time.time())
-    envs = make_eval_envs(
-        args.env_id,
-        args.num_eval_envs,
-        args.sim_backend,
-        env_kwargs,
-        other_kwargs,
-        video_dir=f"runs/{run_name}/videos" if args.capture_video else None,
-        wrappers=eval_wrappers,
-        base_seed=eval_base_seed,
-    )
+    envs = None
 
     if args.track:
         import wandb
@@ -822,7 +815,7 @@ if __name__ == "__main__":
             group="DiffusionPolicy",
             tags=["diffusion_policy"],
         )
-    writer = SummaryWriter(f"runs/{run_name}")
+    writer = SummaryWriter(run_dir)
     writer.add_text(
         "hyperparameters",
         "|param|value|\n|-|-|\n%s"
@@ -897,8 +890,25 @@ if __name__ == "__main__":
     timings = defaultdict(float)
 
     # define evaluation and logging functions
+    def build_eval_envs():
+        eval_base_seed = int(time.time())
+        return make_eval_envs(
+            args.env_id,
+            args.num_eval_envs,
+            args.sim_backend,
+            env_kwargs,
+            other_kwargs,
+            video_dir=os.path.join(run_dir, "videos") if args.capture_video else None,
+            wrappers=eval_wrappers,
+            base_seed=eval_base_seed,
+        )
+
     def evaluate_and_save_best(iteration):
+        global envs
         if iteration % args.eval_freq == 0:
+            if envs is not None:
+                envs.close()
+            envs = build_eval_envs()
             last_tick = time.time()
             ema.copy_to(ema_agent.parameters())
             eval_metrics = evaluate(
@@ -916,7 +926,7 @@ if __name__ == "__main__":
             for k in save_on_best_metrics:
                 if k in eval_metrics and eval_metrics[k] > best_eval_metrics[k]:
                     best_eval_metrics[k] = eval_metrics[k]
-                    save_ckpt(run_name, f"best_eval_{k}")
+                    save_ckpt(run_dir, f"best_eval_{k}")
                     print(
                         f"New best {k}_rate: {eval_metrics[k]:.4f}. Saving checkpoint."
                     )
@@ -966,12 +976,14 @@ if __name__ == "__main__":
 
         # Checkpoint
         if args.save_freq is not None and iteration % args.save_freq == 0:
-            save_ckpt(run_name, str(iteration))
+            save_ckpt(run_dir, str(iteration))
         pbar.update(1)
         pbar.set_postfix({"loss": total_loss.item()})
         last_tick = time.time()
 
     evaluate_and_save_best(args.total_iters)
+    if envs is not None:
+        envs.close()
     log_metrics(args.total_iters)
 
     envs.close()
