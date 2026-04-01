@@ -39,54 +39,6 @@ from diffusion_policy.utils import (IterationBasedBatchSampler,
 
 
 PROMPT_CAMERAS = ["base_camera", "left_side_camera", "right_side_camera"]
-PROMPT_BOX_DIM_PER_CAMERA = 8
-PROMPT_RAW_DIM = PROMPT_BOX_DIM_PER_CAMERA * len(PROMPT_CAMERAS) + 1
-PROMPT_BOX_SIZE_PX = 32.0
-
-
-def prompt_raw_dim() -> int:
-    return 8 * len(PROMPT_CAMERAS) + 1
-
-
-def _xyxy_from_corners(corners: dict):
-    top_left = corners.get("top_left")
-    bottom_right = corners.get("bottom_right")
-    if top_left is None or bottom_right is None:
-        return None
-    return [
-        float(top_left[0]),
-        float(top_left[1]),
-        float(bottom_right[0]),
-        float(bottom_right[1]),
-    ]
-
-
-def _xyxy_from_center(center, box_size_px: float = PROMPT_BOX_SIZE_PX):
-    if center is None:
-        return None
-    half_box = float(box_size_px) / 2.0
-    cx = float(center[0])
-    cy = float(center[1])
-    return [cx - half_box, cy - half_box, cx + half_box, cy + half_box]
-
-
-def _extract_prompt_box_xyxy(cam_data: dict, prefix: str):
-    box_key = f"{prefix}_box"
-    if isinstance(cam_data.get(box_key), (list, tuple)) and len(cam_data[box_key]) == 4:
-        return [float(v) for v in cam_data[box_key]]
-
-    corners_key = f"{prefix}_box_corners"
-    if isinstance(cam_data.get(corners_key), dict):
-        xyxy = _xyxy_from_corners(cam_data[corners_key])
-        if xyxy is not None:
-            return xyxy
-        center = cam_data[corners_key].get("center")
-        xyxy = _xyxy_from_center(center)
-        if xyxy is not None:
-            return xyxy
-
-    center_key = f"{prefix}_center_px"
-    return _xyxy_from_center(cam_data.get(center_key))
 
 
 @dataclass
@@ -138,7 +90,7 @@ class Args:
     )
     visual_feature_dim: int = 512
     """output dimension of the visual encoder. Larger values give the UNet more rich visual conditioning."""
-    encoder: str = "resnet18"
+    encoder: str = "plainconv"
     """visual encoder type: 'plainconv' or 'resnet18'. resnet18 uses pretrained ImageNet weights."""
 
     # Environment/experiment specific arguments
@@ -148,11 +100,11 @@ class Args:
     """Override environment max_episode_steps. Set to 300 to exceed the longest demo (~231 steps)."""
     log_freq: int = 1000
     """the frequency of logging the training metrics"""
-    eval_freq: int = 1000
+    eval_freq: int = 5000
     """the frequency of evaluating the agent on the evaluation environments"""
     save_freq: Optional[int] = None
     """the frequency of saving the model checkpoints. By default this is None and will only save checkpoints based on the best evaluation metrics."""
-    num_eval_episodes: int = 20
+    num_eval_episodes: int = 100
     """the number of episodes to evaluate the agent on"""
     num_eval_envs: int = 10
     """the number of parallel environments to evaluate the agent on"""
@@ -189,16 +141,6 @@ def reorder_keys(d, ref_dict):
         else:
             out[k] = d[k]
     return out
-
-
-def encode_rgb_for_storage(rgb: torch.Tensor) -> torch.Tensor:
-    return rgb.to(torch.int16).sub_(128).to(torch.int8)
-
-
-def decode_rgb_for_encoder(rgb: torch.Tensor) -> torch.Tensor:
-    if rgb.dtype == torch.int8:
-        return rgb.to(torch.int16).add_(128).to(torch.float32) / 255.0
-    return rgb.to(torch.float32) / 255.0
 
 
 class SmallDemoDataset_DiffusionPolicy(Dataset):  # Load everything into memory
@@ -238,9 +180,9 @@ class SmallDemoDataset_DiffusionPolicy(Dataset):  # Load everything into memory
                     _obs_traj_dict["depth"].astype(np.float32)
                 ).to(device=device, dtype=torch.float16)
             if self.include_rgb:
-                _obs_traj_dict["rgb"] = encode_rgb_for_storage(
-                    torch.from_numpy(_obs_traj_dict["rgb"])
-                ).to(device)
+                _obs_traj_dict["rgb"] = torch.from_numpy(_obs_traj_dict["rgb"]).to(
+                    device
+                )  # still uint8
             _obs_traj_dict["state"] = torch.from_numpy(_obs_traj_dict["state"]).to(
                 device
             )
@@ -266,7 +208,7 @@ class SmallDemoDataset_DiffusionPolicy(Dataset):  # Load everything into memory
                         print(f"[prompt-skip] traj_idx={i}, episode_id={prompt_episode_id}: {e}")
                     continue
             else:
-                goal_prompt = torch.zeros(prompt_raw_dim(), dtype=torch.float32, device=device)
+                goal_prompt = torch.zeros(4 * len(PROMPT_CAMERAS) + 1, dtype=torch.float32, device=device)
 
             goal_prompt_list.append(goal_prompt)
             kept_actions.append(trajectories["actions"][i])
@@ -404,14 +346,10 @@ class SmallDemoDataset_DiffusionPolicy(Dataset):  # Load everything into memory
         if ep_idx in self._prompt_json_cache:
             return self._prompt_json_cache[ep_idx]
 
-        candidates = [
-            os.path.join(prompt_dir, f"ep{ep_idx}_boxes_with_corners.json"),
-            os.path.join(prompt_dir, f"ep{ep_idx}_boxes.json"),
-        ]
-        p = next((candidate for candidate in candidates if os.path.exists(candidate)), None)
-        if p is None:
+        p = os.path.join(prompt_dir, f"ep{ep_idx}_boxes.json")
+        if not os.path.exists(p):
             raise FileNotFoundError(
-                f"Missing visual prompt file for episode {ep_idx}. Checked: {candidates}"
+                f"Missing visual prompt file for episode {ep_idx}: {p}"
             )
         with open(p, "r") as f:
             data = json.load(f)
@@ -429,11 +367,11 @@ class SmallDemoDataset_DiffusionPolicy(Dataset):  # Load everything into memory
         """
         Build a fixed-size prompt vector:
         For each camera in PROMPT_CAMERAS:
-        [init_x1, init_y1, init_x2, init_y2, goal_x1, goal_y1, goal_x2, goal_y2]
+        [init_cx, init_cy, goal_cx, goal_cy]
         then append [has_prompt].
         all normalized to [0, 1]. Strict mode: any missing field raises an error.
         """
-        vec = torch.zeros(prompt_raw_dim(), dtype=torch.float32, device=device)
+        vec = torch.zeros(4 * len(PROMPT_CAMERAS) + 1, dtype=torch.float32, device=device)
         if prompt_dir is None:
             raise ValueError("prompt_dir must be provided when use_visual_prompt=True")
 
@@ -451,11 +389,15 @@ class SmallDemoDataset_DiffusionPolicy(Dataset):  # Load everything into memory
                     f"Available cameras: {list(cams.keys())}"
                 )
 
-            init_box = _extract_prompt_box_xyxy(cam_data, "init")
-            goal_box = _extract_prompt_box_xyxy(cam_data, "goal")
-            if init_box is None or goal_box is None:
+            init_center = cam_data.get("init_center_px")
+            goal_center = cam_data.get("goal_center_px")
+            if init_center is None and isinstance(cam_data.get("init_box_corners"), dict):
+                init_center = cam_data["init_box_corners"].get("center")
+            if goal_center is None and isinstance(cam_data.get("goal_box_corners"), dict):
+                goal_center = cam_data["goal_box_corners"].get("center")
+            if init_center is None or goal_center is None:
                 raise KeyError(
-                    f"Missing init/goal box for episode {prompt_episode_id} (traj_idx={traj_idx}), camera '{cam_name}'"
+                    f"Missing init/goal center for episode {prompt_episode_id} (traj_idx={traj_idx}), camera '{cam_name}'"
                 )
 
             rgb = raw_obs_traj_dict["sensor_data"][cam_name]["rgb"]
@@ -463,22 +405,11 @@ class SmallDemoDataset_DiffusionPolicy(Dataset):  # Load everything into memory
             if H <= 0 or W <= 0:
                 raise ValueError(f"Invalid image size for prompt camera '{cam_name}': H={H}, W={W}")
 
-            init_box = [
-                min(max(float(init_box[0]) / W, 0.0), 1.0),
-                min(max(float(init_box[1]) / H, 0.0), 1.0),
-                min(max(float(init_box[2]) / W, 0.0), 1.0),
-                min(max(float(init_box[3]) / H, 0.0), 1.0),
-            ]
-            goal_box = [
-                min(max(float(goal_box[0]) / W, 0.0), 1.0),
-                min(max(float(goal_box[1]) / H, 0.0), 1.0),
-                min(max(float(goal_box[2]) / W, 0.0), 1.0),
-                min(max(float(goal_box[3]) / H, 0.0), 1.0),
-            ]
-
-            values = init_box + goal_box
-            vec[write_idx : write_idx + 8] = torch.tensor(values, dtype=torch.float32, device=device)
-            write_idx += 8
+            vec[write_idx + 0] = float(init_center[0]) / W
+            vec[write_idx + 1] = float(init_center[1]) / H
+            vec[write_idx + 2] = float(goal_center[0]) / W
+            vec[write_idx + 3] = float(goal_center[1]) / H
+            write_idx += 4
 
         vec[-1] = 1.0
         return vec
@@ -533,7 +464,7 @@ class Agent(nn.Module):
         self.act_horizon = args.act_horizon
         self.pred_horizon = args.pred_horizon
         self.use_visual_prompt = args.use_visual_prompt
-        self.prompt_raw_dim = prompt_raw_dim()
+        self.prompt_raw_dim = 4 * len(PROMPT_CAMERAS) + 1
         assert (
             len(env.single_observation_space["state"].shape) == 2
         )  # (obs_horizon, obs_dim)
@@ -595,7 +526,7 @@ class Agent(nn.Module):
 
     def encode_obs(self, obs_seq, eval_mode, goal_prompt=None):
         if self.include_rgb:
-            rgb = decode_rgb_for_encoder(obs_seq["rgb"])  # (B, obs_horizon, 3*k, H, W)
+            rgb = obs_seq["rgb"].float() / 255.0  # (B, obs_horizon, 3*k, H, W)
             img_seq = rgb
         if self.include_depth:
             depth = obs_seq["depth"].float() / 1024.0  # (B, obs_horizon, 1*k, H, W)
@@ -710,15 +641,15 @@ class Agent(nn.Module):
         return actions  # (B, act_horizon, act_dim)
 
 
-def save_ckpt(run_dir, tag):
-    os.makedirs(os.path.join(run_dir, "checkpoints"), exist_ok=True)
+def save_ckpt(run_name, tag):
+    os.makedirs(f"runs/{run_name}/checkpoints", exist_ok=True)
     ema.copy_to(ema_agent.parameters())
     torch.save(
         {
             "agent": agent.state_dict(),
             "ema_agent": ema_agent.state_dict(),
         },
-        os.path.join(run_dir, "checkpoints", f"{tag}.pt"),
+        f"runs/{run_name}/checkpoints/{tag}.pt",
     )
 
 
@@ -730,12 +661,9 @@ if __name__ == "__main__":
 
     if args.exp_name is None:
         args.exp_name = os.path.basename(__file__)[: -len(".py")]
-        run_name = f"{args.env_id}__{args.exp_name}__{args.encoder}__{args.seed}__{int(time.time())}"
+        run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
     else:
         run_name = args.exp_name
-
-    run_dir = os.path.join("runs", run_name)
-    os.makedirs(run_dir, exist_ok=True)
 
     demo_info = None
     if args.demo_path.endswith(".h5"):
@@ -772,7 +700,7 @@ if __name__ == "__main__":
         obs_mode=args.obs_mode,
         render_mode="rgb_array",
         human_render_camera_configs=dict(shader_pack="default"),
-        sensor_configs=dict(width=512, height=512),
+        sensor_configs=dict(width=128, height=128),
     )
     assert args.max_episode_steps is not None, "max_episode_steps must be specified as imitation learning algorithms task solve speed is dependent on the data you train on"
     env_kwargs["max_episode_steps"] = args.max_episode_steps
@@ -789,7 +717,7 @@ if __name__ == "__main__":
     other_kwargs = dict(obs_horizon=args.obs_horizon)
     eval_wrappers = [FlattenRGBDObservationWrapper]
     if args.use_visual_prompt:
-        eval_prompt_viz_dir = os.path.join(run_dir, "prompt_viz") if args.save_eval_prompt_viz else None
+        eval_prompt_viz_dir = f"runs/{run_name}/prompt_viz" if args.save_eval_prompt_viz else None
         eval_wrappers = [
             FlattenRGBDObservationWrapper,
             partial(
@@ -799,7 +727,15 @@ if __name__ == "__main__":
             ),
         ]
 
-    envs = None
+    envs = make_eval_envs(
+        args.env_id,
+        args.num_eval_envs,
+        args.sim_backend,
+        env_kwargs,
+        other_kwargs,
+        video_dir=f"runs/{run_name}/videos" if args.capture_video else None,
+        wrappers=eval_wrappers,
+    )
 
     if args.track:
         import wandb
@@ -815,7 +751,7 @@ if __name__ == "__main__":
             group="DiffusionPolicy",
             tags=["diffusion_policy"],
         )
-    writer = SummaryWriter(run_dir)
+    writer = SummaryWriter(f"runs/{run_name}")
     writer.add_text(
         "hyperparameters",
         "|param|value|\n|-|-|\n%s"
@@ -890,25 +826,8 @@ if __name__ == "__main__":
     timings = defaultdict(float)
 
     # define evaluation and logging functions
-    def build_eval_envs():
-        eval_base_seed = int(time.time())
-        return make_eval_envs(
-            args.env_id,
-            args.num_eval_envs,
-            args.sim_backend,
-            env_kwargs,
-            other_kwargs,
-            video_dir=os.path.join(run_dir, "videos") if args.capture_video else None,
-            wrappers=eval_wrappers,
-            base_seed=eval_base_seed,
-        )
-
     def evaluate_and_save_best(iteration):
-        global envs
         if iteration % args.eval_freq == 0:
-            if envs is not None:
-                envs.close()
-            envs = build_eval_envs()
             last_tick = time.time()
             ema.copy_to(ema_agent.parameters())
             eval_metrics = evaluate(
@@ -926,7 +845,7 @@ if __name__ == "__main__":
             for k in save_on_best_metrics:
                 if k in eval_metrics and eval_metrics[k] > best_eval_metrics[k]:
                     best_eval_metrics[k] = eval_metrics[k]
-                    save_ckpt(run_dir, f"best_eval_{k}")
+                    save_ckpt(run_name, f"best_eval_{k}")
                     print(
                         f"New best {k}_rate: {eval_metrics[k]:.4f}. Saving checkpoint."
                     )
@@ -976,14 +895,12 @@ if __name__ == "__main__":
 
         # Checkpoint
         if args.save_freq is not None and iteration % args.save_freq == 0:
-            save_ckpt(run_dir, str(iteration))
+            save_ckpt(run_name, str(iteration))
         pbar.update(1)
         pbar.set_postfix({"loss": total_loss.item()})
         last_tick = time.time()
 
     evaluate_and_save_best(args.total_iters)
-    if envs is not None:
-        envs.close()
     log_metrics(args.total_iters)
 
     envs.close()

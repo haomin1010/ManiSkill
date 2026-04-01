@@ -5,6 +5,7 @@ import torch.distributed as dist
 from torch import Tensor
 from h5py import File, Group, Dataset
 from typing import Optional
+from tqdm import tqdm
 
 
 class NestedTensor(object):
@@ -98,7 +99,8 @@ TARGET_KEY_TO_SOURCE_KEY = {
 }
 def load_content_from_h5_file(file):
     if isinstance(file, (File, Group)):
-        return {key: load_content_from_h5_file(file[key]) for key in list(file.keys())}
+        keys = list(file.keys())
+        return {key: load_content_from_h5_file(file[key]) for key in keys}
     elif isinstance(file, Dataset):
         return file[()]
     else:
@@ -120,9 +122,9 @@ def load_traj_hdf5(path, num_traj=None):
         assert num_traj <= len(keys), f"num_traj: {num_traj} > len(keys): {len(keys)}"
         keys = sorted(keys, key=lambda x: int(x.split('_')[-1]))
         keys = keys[:num_traj]
-    ret = {
-        key: load_content_from_h5_file(file[key]) for key in keys
-    }
+    ret = {}
+    for key in tqdm(keys, desc="Loading HDF5 trajectories", leave=False):
+        ret[key] = load_content_from_h5_file(file[key])
     file.close()
     print('Loaded')
     return ret

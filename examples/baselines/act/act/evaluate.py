@@ -2,10 +2,11 @@ from collections import defaultdict
 import gymnasium
 import numpy as np
 import torch
+from tqdm import tqdm
 
 from mani_skill.utils import common
 
-def evaluate(n: int, agent, eval_envs, eval_kwargs):
+def evaluate(n: int, agent, eval_envs, eval_kwargs, progress_bar: bool = True):
     stats, num_queries, temporal_agg, max_timesteps, device, sim_backend = eval_kwargs.values()
 
     use_visual_obs = isinstance(eval_envs.single_observation_space.sample(), dict)
@@ -28,6 +29,7 @@ def evaluate(n: int, agent, eval_envs, eval_kwargs):
         actions_to_take = torch.zeros([num_envs, num_queries, action_dim], device=device)
 
     agent.eval()
+    pbar = tqdm(total=n, desc="Evaluating", disable=not progress_bar, dynamic_ncols=True)
     with torch.no_grad():
         eval_metrics = defaultdict(list)
         obs, info = eval_envs.reset()
@@ -89,10 +91,13 @@ def evaluate(n: int, agent, eval_envs, eval_kwargs):
                             eval_metrics[k].append(v)
                 # new episodes begin
                 eps_count += num_envs
+                pbar.update(num_envs)
                 ts = 0
-                all_time_actions = torch.zeros([num_envs, max_timesteps, max_timesteps+num_queries, action_dim], device=device)
+                if temporal_agg:
+                    all_time_actions = torch.zeros([num_envs, max_timesteps, max_timesteps+num_queries, action_dim], device=device)
 
     agent.train()
+    pbar.close()
     for k in eval_metrics.keys():
         eval_metrics[k] = np.stack(eval_metrics[k])
     return eval_metrics

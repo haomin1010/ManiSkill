@@ -27,20 +27,40 @@ def make_eval_envs(env_id, num_envs: int, sim_backend: str, env_kwargs: dict, ot
                     env = wrapper(env)
                 env = CPUGymWrapper(env, ignore_terminations=True, record_metrics=True)
                 if video_dir:
-                    env = RecordEpisode(env, output_dir=video_dir, save_trajectory=False, info_on_video=True, source_type="act", source_desc="act evaluation rollout")
+                    env = RecordEpisode(
+                        env,
+                        output_dir=video_dir,
+                        save_trajectory=False,
+                        save_video=True,
+                        info_on_video=True,
+                        avoid_overwriting_video=True,
+                        source_type="act",
+                        source_desc="act evaluation rollout",
+                    )
                 env.action_space.seed(seed)
                 env.observation_space.seed(seed)
                 return env
 
             return thunk
         vector_cls = gym.vector.SyncVectorEnv if num_envs == 1 else lambda x : gym.vector.AsyncVectorEnv(x, context="forkserver")
-        env = vector_cls([cpu_make_env(env_id, seed, video_dir if seed == 0 else None, env_kwargs, other_kwargs) for seed in range(num_envs)])
+        env = vector_cls(
+            [
+                cpu_make_env(
+                    env_id,
+                    seed,
+                    video_dir if env_idx == 0 else None,
+                    env_kwargs,
+                    other_kwargs,
+                )
+                for env_idx, seed in enumerate(range(num_envs))
+            ]
+        )
     else:
         env = gym.make(env_id, num_envs=num_envs, sim_backend=sim_backend, reconfiguration_freq=1, **env_kwargs)
         max_episode_steps = gym_utils.find_max_episode_steps_value(env)
         for wrapper in wrappers:
             env = wrapper(env)
         if video_dir:
-            env = RecordEpisode(env, output_dir=video_dir, save_trajectory=False, save_video=True, source_type="act", source_desc="act evaluation rollout", max_steps_per_video=max_episode_steps)
+            env = RecordEpisode(env, output_dir=video_dir, save_trajectory=False, save_video=True, avoid_overwriting_video=True, source_type="act", source_desc="act evaluation rollout", max_steps_per_video=max_episode_steps)
         env = ManiSkillVectorEnv(env, ignore_terminations=True, record_metrics=True)
     return env

@@ -3,6 +3,7 @@
 Backbone modules.
 """
 from collections import OrderedDict
+import warnings
 
 import torch
 import torch.nn.functional as F
@@ -89,6 +90,12 @@ class Backbone(BackboneBase):
                  return_interm_layers: bool,
                  dilation: bool,
                  include_depth: bool):
+        if dilation and name in ("resnet18", "resnet34"):
+            warnings.warn(
+                f"Backbone {name} does not support dilation>1 in torchvision BasicBlock; falling back to dilation=False.",
+                UserWarning,
+            )
+            dilation = False
         backbone = getattr(torchvision.models, name)(
             replace_stride_with_dilation=[False, False, dilation],
             pretrained=is_main_process(), norm_layer=FrozenBatchNorm2d) # pretrained # TODO do we want frozen batch_norm??
