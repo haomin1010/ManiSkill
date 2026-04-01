@@ -1,6 +1,11 @@
 ALGO_NAME = "BC_Diffusion_rgb_UNet_StackCube"
 
+
 import os
+os.environ.setdefault("PYTHONWARNINGS", "ignore::UserWarning")
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning)
+warnings.filterwarnings("ignore", category=FutureWarning)
 import json
 import random
 import time
@@ -63,7 +68,7 @@ class Args:
     env_id: str = "StackCube-v1"
     """the id of the environment"""
     demo_path: str = (
-        "videos/StackCube-v1/stackcube_expert.rgb.pd_ee_delta_pos.physx_cpu.h5"
+        "videos/StackCube-new/videos_0401/videos/StackCube-v1/stackcube_expert.rgb.pd_ee_delta_pos.physx_cpu.h5"
     )
     """the path of demo dataset, it is expected to be a ManiSkill dataset h5py format file"""
     num_demos: Optional[int] = 100
@@ -123,7 +128,7 @@ class Args:
     # visual prompt conditioning (optional)
     use_visual_prompt: bool = True
     """Whether to condition policy on first-frame visual prompt (bbox/center) from prompt JSONs."""
-    prompt_dir: Optional[str] = "videos_new/screenshots"
+    prompt_dir: Optional[str] = "videos/StackCube-new/videos_0401/videos/StackCube-v1/screenshots"
     """Directory containing ep{idx}_boxes_with_corners.json / ep{idx}_boxes.json files."""
     prompt_embed_dim: int = 64
     """Embedding dimension for visual prompt MLP."""
