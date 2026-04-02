@@ -220,9 +220,17 @@ def solve(env: StackCubeEnv, seed=None, debug=False, vis=False, do_reset=True, a
     res = planner.open_gripper()
     print(f"[solve] open gripper, result={res}")
 
-    # 任务完成后将机械臂复位到同一个 home pose，避免遮挡最后若干帧的视野
-    # 结束时不再强制回 home，避免额外长轨迹；此处只打印一行标记结束。
-    print("[solve] end of task (no explicit home move)")
+    # -------------------------------------------------------------------------- #
+    # Reset：在成功放置并松爪之后，再次回到开头使用的简单 home pose
+    # 这样可以在数据中记录一个“复位”过程，方便训练包含复位段的策略 / 视觉先验。
+    # -------------------------------------------------------------------------- #
+    print("[solve] move back to simple home pose for reset (+0.3m)")
+    planner.elapsed_steps = 0
+    res_reset = planner.move_to_pose_with_screw(home_pose)
+    reset_steps = int(planner.elapsed_steps)
+    print(f"[solve] reset home pose result={res_reset}, reset_steps={reset_steps}")
+
+    print("[solve] end of task (with explicit reset home move)")
     planner.close()
     print("[solve] done")
     # 返回：任务是否成功 + home 段所占的步数（用于后处理时裁剪前缀）
