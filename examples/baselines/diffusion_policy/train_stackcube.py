@@ -58,10 +58,10 @@ class Args:
     env_id: str = "StackCube-v1"
     """the id of the environment"""
     demo_path: str = (
-        "videos/StackCube-v1/stackcube_expert.rgb.pd_ee_delta_pos.physx_cpu.h5"
+        "videos/StackCube-rgb-v1/stackcube_expert.rgb.pd_ee_delta_pos.physx_cpu.h5"
     )
     """the path of demo dataset, it is expected to be a ManiSkill dataset h5py format file"""
-    num_demos: Optional[int] = None
+    num_demos: Optional[int] = 200
     """number of trajectories to load from the demo dataset"""
     total_iters: int = 1_000_000
     """total timesteps of the experiment"""
@@ -111,6 +111,9 @@ class Args:
     """the control mode to use for the evaluation environments. Must match the control mode of the demonstration dataset."""
     close_camera: bool = False
     """Use closer camera view (e.g. for StackCube). Must match the camera config used when recording demonstrations."""
+
+    include_hand_camera: bool = False
+    """If toggled, keep hand_camera in visual observations. Otherwise it will be filtered out."""
 
     # additional tags/configs for logging purposes to wandb and shared comparisons with other algorithms
     demo_type: Optional[str] = None
@@ -493,6 +496,7 @@ if __name__ == "__main__":
               f"num_distractor_cubes={env_kwargs.get('num_distractor_cubes')}")
     if args.close_camera:
         env_kwargs["close_camera"] = True
+    excluded_cameras = [] if args.include_hand_camera else ["hand_camera"]
     other_kwargs = dict(obs_horizon=args.obs_horizon)
     envs = make_eval_envs(
         args.env_id,
@@ -501,7 +505,7 @@ if __name__ == "__main__":
         env_kwargs,
         other_kwargs,
         video_dir=f"runs/{run_name}/videos" if args.capture_video else None,
-        wrappers=[FlattenRGBDObservationWrapper],
+        wrappers=[partial(FlattenRGBDObservationWrapper, exclude_camera_names=excluded_cameras)],
     )
 
     if args.track:
@@ -533,6 +537,7 @@ if __name__ == "__main__":
         ),  # (B, H, W, C) -> (B, C, H, W)
         state_obs_extractor=build_state_obs_extractor(args.env_id),
         depth=False,  # dataset was generated with -o rgb, no depth channel
+        exclude_camera_names=excluded_cameras,
     )
 
     # create temporary env to get original observation space as AsyncVectorEnv (CPU parallelization) doesn't permit that

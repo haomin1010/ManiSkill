@@ -155,8 +155,19 @@ def _resize_img_to(img: np.ndarray, target_h: int, target_w: int) -> np.ndarray:
     return img
 
 
-def convert_obs(obs, concat_fn, transpose_fn, state_obs_extractor, depth=True, target_size=(128, 128)):
+def convert_obs(
+    obs,
+    concat_fn,
+    transpose_fn,
+    state_obs_extractor,
+    depth=True,
+    target_size=(128, 128),
+    exclude_camera_names=None,
+):
     img_dict = obs["sensor_data"]
+    if exclude_camera_names:
+        exclude_camera_names = set(exclude_camera_names)
+        img_dict = {k: v for k, v in img_dict.items() if k not in exclude_camera_names}
     # [DEBUG] 首次调用时打印 sensor_data 的相机顺序（决定 concat 后的通道顺序）
     if not hasattr(convert_obs, "_logged"):
         cam_order = list(img_dict.keys())

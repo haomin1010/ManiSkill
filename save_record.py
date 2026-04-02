@@ -11,6 +11,34 @@ from mani_skill.utils.wrappers.record import RecordEpisode
 from mani_skill.examples.motionplanning.panda.solutions.stack_cube import solve
 
 
+class DropCameraObservationWrapper(gym.Wrapper):
+    def __init__(self, env, camera_names):
+        super().__init__(env)
+        self.camera_names = set(camera_names)
+
+    def _filter_obs(self, obs):
+        if not isinstance(obs, dict):
+            return obs
+
+        obs = dict(obs)
+        for key in ("sensor_data", "sensor_param"):
+            value = obs.get(key)
+            if isinstance(value, dict):
+                value = dict(value)
+                for camera_name in self.camera_names:
+                    value.pop(camera_name, None)
+                obs[key] = value
+        return obs
+
+    def reset(self, **kwargs):
+        obs, info = self.env.reset(**kwargs)
+        return self._filter_obs(obs), info
+
+    def step(self, action):
+        obs, rew, term, trunc, info = self.env.step(action)
+        return self._filter_obs(obs), rew, term, trunc, info
+
+
 def get_static_cube_positions(env):
     """
     获取不应该被碰撞的静态方块位置。
@@ -211,6 +239,9 @@ def main():
         render_mode="rgb_array",
         close_camera=args.close_camera,
     )
+
+    # 只去掉导出的腕部相机图像，不改变机器人本体或环境后端配置。
+    env = DropCameraObservationWrapper(env, camera_names=["hand_camera"])
 
     env = RecordEpisode(
         env,

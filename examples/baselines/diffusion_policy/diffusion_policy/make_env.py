@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Callable, Optional
 import gymnasium as gym
 import numpy as np
 import torch
@@ -14,7 +14,7 @@ def make_eval_envs(
     env_kwargs: dict,
     other_kwargs: dict,
     video_dir: Optional[str] = None,
-    wrappers: list[gym.Wrapper] = [],
+    wrappers: list[Callable[[gym.Env], gym.Wrapper]] = [],
 ):
     """Create vectorized environment for evaluation and/or recording videos.
     For CPU vectorized environments only the first parallel environment is used to record videos.
