@@ -16,9 +16,10 @@ DEFAULT_PROMPT_CAMERAS = ["base_camera", "left_side_camera", "right_side_camera"
 class DynamicStackCubeGoalPromptWrapper(gym.Wrapper):
     """Attach a per-episode visual goal prompt computed from the live env state.
 
-    This wrapper assumes it receives flattened RGB observations (e.g. after
+    This wrapper assumes it receives flattened visual observations (e.g. after
     FlattenRGBDObservationWrapper), and it adds a separate `goal_prompt` key that is
-    compatible with the training prompt format.
+    compatible with the training prompt format. The prompt is modality-agnostic and
+    can be computed when RGB is absent (e.g. depth-only observations).
     """
 
     def __init__(
@@ -174,19 +175,23 @@ class DynamicStackCubeGoalPromptWrapper(gym.Wrapper):
                 cv2.imwrite(str(self.output_dir / f"{stem}.png"), canvas)
 
     def _get_camera_size(self, observation: dict):
-        rgb = observation.get("rgb")
-        if rgb is None:
-            raise ValueError("DynamicStackCubeGoalPromptWrapper requires 'rgb' observation")
-        if isinstance(rgb, torch.Tensor):
-            shape = tuple(rgb.shape)
+        visual = observation.get("rgb")
+        if visual is None:
+            visual = observation.get("depth")
+        if visual is None:
+            raise ValueError(
+                "DynamicStackCubeGoalPromptWrapper requires either 'rgb' or 'depth' observation"
+            )
+        if isinstance(visual, torch.Tensor):
+            shape = tuple(visual.shape)
         else:
-            shape = tuple(np.asarray(rgb).shape)
+            shape = tuple(np.asarray(visual).shape)
         if len(shape) == 3:
             height, width = shape[0], shape[1]
         elif len(shape) == 4:
             height, width = shape[1], shape[2]
         else:
-            raise ValueError(f"Unexpected flattened rgb shape: {shape}")
+            raise ValueError(f"Unexpected flattened visual shape: {shape}")
         return float(width), float(height)
 
     @staticmethod

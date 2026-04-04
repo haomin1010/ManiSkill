@@ -158,26 +158,69 @@ def _resize_img_to(img: np.ndarray, target_h: int, target_w: int) -> np.ndarray:
     return img
 
 
-def convert_obs(obs, concat_fn, transpose_fn, state_obs_extractor, depth=True, target_size=(128, 128)):
+def convert_obs(
+    obs,
+    concat_fn,
+    transpose_fn,
+    state_obs_extractor,
+    depth=True,
+    rgb=True,
+    target_size=(128, 128),
+):
     img_dict = obs["sensor_data"]
     # [DEBUG] 首次调用时打印 sensor_data 的相机顺序（决定 concat 后的通道顺序）
     if not hasattr(convert_obs, "_logged"):
         cam_order = list(img_dict.keys())
-        n_cams = len([v for v in img_dict.values() if isinstance(v, dict) and "rgb" in v])
-        print(f"[DEBUG] convert_obs 首次调用: sensor_data 相机顺序 = {cam_order}, 含 rgb 的数量 = {n_cams}, 预期 C = {n_cams * 3}")
+        n_rgb_cams = len([v for v in img_dict.values() if isinstance(v, dict) and "rgb" in v])
+        n_depth_cams = len([v for v in img_dict.values() if isinstance(v, dict) and "depth" in v])
+        print(
+            f"[DEBUG] convert_obs 首次调用: sensor_data 相机顺序 = {cam_order}, "
+            f"含 rgb 的数量 = {n_rgb_cams}, 含 depth 的数量 = {n_depth_cams}"
+        )
         convert_obs._logged = True
-    ls = ["rgb"]
+
+    ls = []
+    if rgb:
+        ls.append("rgb")
     if depth:
-        ls = ["rgb", "depth"]
+        ls.append("depth")
+    if len(ls) == 0:
+        raise ValueError("convert_obs requires at least one visual modality: rgb or depth")
 
     target_h, target_w = target_size
 
-    new_img_dict = {
-        key: transpose_fn(
-            concat_fn([_resize_img_to(v[key], target_h, target_w) for v in img_dict.values()])
-        )  # (C, H, W) or (B, C, H, W)
-        for key in ls
-    }
+    new_img_dict = {}
+    for key in ls:
+        per_cam = []
+        for cam_name, cam_data in img_dict.items():
+            if key not in cam_data:
+                continue
+            arr = cam_data[key]
+            if key == "depth":
+                arr = np.asarray(arr)
+                # Normalize depth to (..., H, W, 1) before resizing/concatenation.
+                # Common dataset layouts include (T,H,W) and (T,H,W,1).
+                if arr.ndim == 3:
+                    arr = arr[..., None]
+                elif arr.ndim == 2:
+                    arr = arr[None, ..., None]
+            resized = _resize_img_to(arr, target_h, target_w)
+            if key == "depth":
+                resized = np.asarray(resized)
+                # cv2 may squeeze single-channel depth to (..., H, W); restore channel dim.
+                if resized.ndim == 3:
+                    resized = resized[..., None]
+                elif resized.ndim == 2:
+                    resized = resized[None, ..., None]
+            per_cam.append(resized)
+        if len(per_cam) == 0:
+            raise KeyError(
+                f"Requested modality '{key}' but none of the cameras contain it. "
+                f"Available per camera: { {k: list(v.keys()) for k, v in img_dict.items()} }"
+            )
+        new_img_dict[key] = transpose_fn(concat_fn(per_cam))
+        # (C, H, W) or (B, C, H, W)
+
     if "depth" in new_img_dict and isinstance(new_img_dict['depth'], torch.Tensor): # MS2 vec env uses float16, but gym AsyncVecEnv uses float32
         new_img_dict['depth'] = new_img_dict['depth'].to(torch.float16)
 
@@ -197,10 +240,10 @@ def convert_obs(obs, concat_fn, transpose_fn, state_obs_extractor, depth=True, t
 
         pdb.set_trace()
 
-    out_dict = {
-        "state": state,
-        "rgb": new_img_dict["rgb"],
-    }
+    out_dict = {"state": state}
+
+    if "rgb" in new_img_dict:
+        out_dict["rgb"] = new_img_dict["rgb"]
 
     if "depth" in new_img_dict:
         out_dict["depth"] = new_img_dict["depth"]

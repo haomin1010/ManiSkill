@@ -68,10 +68,10 @@ class Args:
     env_id: str = "StackCube-v1"
     """the id of the environment"""
     demo_path: str = (
-        "videos/StackCube-new/videos_0401/videos/StackCube-v1/stackcube_expert.rgb.pd_ee_delta_pos.physx_cpu.h5"
+        "videos_rgbd/stackcube_expert.rgbd.pd_ee_delta_pos.physx_cpu.h5"
     )
     """the path of demo dataset, it is expected to be a ManiSkill dataset h5py format file"""
-    num_demos: Optional[int] = 100
+    num_demos: Optional[int] = 200
     """number of trajectories to load from the demo dataset"""
     total_iters: int = 500_000
     """total timesteps of the experiment"""
@@ -99,8 +99,8 @@ class Args:
     """visual encoder type: 'plainconv' or 'resnet18'. resnet18 uses pretrained ImageNet weights."""
 
     # Environment/experiment specific arguments
-    obs_mode: str = "rgb"
-    """Observation mode. Dataset was generated with -o rgb (no depth)."""
+    obs_mode: str = "depth"
+    """Observation mode. Can be "rgb", "depth", or "rgb+depth"."""
     max_episode_steps: Optional[int] = 300
     """Override environment max_episode_steps. Set to 300 to exceed the longest demo (~231 steps)."""
     log_freq: int = 1000
@@ -405,8 +405,7 @@ class SmallDemoDataset_DiffusionPolicy(Dataset):  # Load everything into memory
                     f"Missing init/goal center for episode {prompt_episode_id} (traj_idx={traj_idx}), camera '{cam_name}'"
                 )
 
-            rgb = raw_obs_traj_dict["sensor_data"][cam_name]["rgb"]
-            H, W = rgb.shape[1], rgb.shape[2]  # rgb: (T, H, W, C)
+            H, W = self._get_camera_hw(raw_obs_traj_dict, cam_name)
             if H <= 0 or W <= 0:
                 raise ValueError(f"Invalid image size for prompt camera '{cam_name}': H={H}, W={W}")
 
@@ -418,6 +417,22 @@ class SmallDemoDataset_DiffusionPolicy(Dataset):  # Load everything into memory
 
         vec[-1] = 1.0
         return vec
+
+    @staticmethod
+    def _get_camera_hw(raw_obs_traj_dict: dict, cam_name: str):
+        """Infer camera frame size from available sensor streams without requiring RGB."""
+        cam_sensor = raw_obs_traj_dict["sensor_data"][cam_name]
+        for key in ("depth", "rgb"):
+            if key not in cam_sensor:
+                continue
+            arr = cam_sensor[key]
+            if arr.ndim < 3:
+                continue
+            # (T, H, W, C?)
+            return int(arr.shape[1]), int(arr.shape[2])
+        raise KeyError(
+            f"Camera '{cam_name}' has neither usable depth nor rgb stream for size inference"
+        )
 
     def __getitem__(self, index):
         traj_idx, start, end = self.slices[index]
@@ -770,7 +785,8 @@ if __name__ == "__main__":
             np.transpose, axes=(0, 3, 1, 2)
         ),  # (B, H, W, C) -> (B, C, H, W)
         state_obs_extractor=build_state_obs_extractor(args.env_id),
-        depth=False,  # dataset was generated with -o rgb, no depth channel
+        rgb=(args.obs_mode in {"rgb", "rgb+depth"}),
+        depth=(args.obs_mode in {"depth", "rgb+depth"}),
     )
 
     # create temporary env to get original observation space as AsyncVectorEnv (CPU parallelization) doesn't permit that
