@@ -166,13 +166,15 @@ def convert_obs(
     depth=True,
     rgb=True,
     target_size=(128, 128),
+    exclude_camera_names=None,
 ):
     img_dict = obs["sensor_data"]
+    exclude_camera_names = set(exclude_camera_names or [])
     # [DEBUG] 首次调用时打印 sensor_data 的相机顺序（决定 concat 后的通道顺序）
     if not hasattr(convert_obs, "_logged"):
-        cam_order = list(img_dict.keys())
-        n_rgb_cams = len([v for v in img_dict.values() if isinstance(v, dict) and "rgb" in v])
-        n_depth_cams = len([v for v in img_dict.values() if isinstance(v, dict) and "depth" in v])
+        cam_order = [k for k in img_dict.keys() if k not in exclude_camera_names]
+        n_rgb_cams = len([v for k, v in img_dict.items() if k not in exclude_camera_names and isinstance(v, dict) and "rgb" in v])
+        n_depth_cams = len([v for k, v in img_dict.items() if k not in exclude_camera_names and isinstance(v, dict) and "depth" in v])
         print(
             f"[DEBUG] convert_obs 首次调用: sensor_data 相机顺序 = {cam_order}, "
             f"含 rgb 的数量 = {n_rgb_cams}, 含 depth 的数量 = {n_depth_cams}"
@@ -193,6 +195,8 @@ def convert_obs(
     for key in ls:
         per_cam = []
         for cam_name, cam_data in img_dict.items():
+            if cam_name in exclude_camera_names:
+                continue
             if key not in cam_data:
                 continue
             arr = cam_data[key]

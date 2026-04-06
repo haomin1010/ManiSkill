@@ -61,7 +61,7 @@ class StackCubeEnv(BaseEnv):
     def __init__(
         self,
         *args,
-        robot_uids="panda_wristcam",
+        robot_uids="panda",
         robot_init_qpos_noise=0.02,
         num_distractor_cubes: int = 0,
         close_camera: bool = False,

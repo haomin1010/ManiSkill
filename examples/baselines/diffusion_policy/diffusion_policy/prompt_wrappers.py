@@ -9,17 +9,22 @@ import torch
 from gymnasium import spaces
 from gymnasium.vector.utils import batch_space
 
+from .heatmap_utils import bbox_centers_to_heatmap_multi_camera
 
-DEFAULT_PROMPT_CAMERAS = ["base_camera", "left_side_camera", "right_side_camera"]
+
+DEFAULT_PROMPT_CAMERAS = ["base_camera", "left_side_camera"]
 
 
 class DynamicStackCubeGoalPromptWrapper(gym.Wrapper):
-    """Attach a per-episode visual goal prompt computed from the live env state.
+    """Attach a per-episode visual goal prompt.
 
     This wrapper assumes it receives flattened visual observations (e.g. after
     FlattenRGBDObservationWrapper), and it adds a separate `goal_prompt` key that is
     compatible with the training prompt format. The prompt is modality-agnostic and
     can be computed when RGB is absent (e.g. depth-only observations).
+
+    Note: goal_prompt is computed once at reset and then cached for the whole
+    episode to keep train/eval behavior consistent (fixed prompt per episode).
     """
 
     def __init__(
@@ -29,22 +34,40 @@ class DynamicStackCubeGoalPromptWrapper(gym.Wrapper):
         box_size_px: float = 32.0,
         output_dir: str = None,
         save_visualizations: bool = True,
+        use_heatmap_prompt: bool = True,
+        heatmap_h: int = 32,
+        heatmap_w: int = 32,
+        heatmap_sigma: float = 3.0,
     ) -> None:
         super().__init__(env)
         self.prompt_cameras = list(prompt_cameras)
         self.box_size_px = float(box_size_px)
-        self.prompt_raw_dim = 4 * len(self.prompt_cameras) + 1
+        self.use_heatmap_prompt = bool(use_heatmap_prompt)
+        self.heatmap_h = int(heatmap_h)
+        self.heatmap_w = int(heatmap_w)
+        self.heatmap_sigma = float(heatmap_sigma)
+        
         self.output_dir = None if output_dir is None else Path(output_dir)
         self.save_visualizations = bool(save_visualizations)
         self._cached_goal_prompt = None
         self._episode_counter = 0
 
-        prompt_space = spaces.Box(
-            low=0.0,
-            high=1.0,
-            shape=(self.prompt_raw_dim,),
-            dtype=np.float32,
-        )
+        if self.use_heatmap_prompt:
+            heatmap_channels = 2 * len(self.prompt_cameras)  # init + goal for each camera
+            prompt_space = spaces.Box(
+                low=0.0,
+                high=1.0,
+                shape=(heatmap_channels, self.heatmap_h, self.heatmap_w),
+                dtype=np.float32,
+            )
+        else:
+            prompt_raw_dim = 4 * len(self.prompt_cameras) + 1
+            prompt_space = spaces.Box(
+                low=0.0,
+                high=1.0,
+                shape=(prompt_raw_dim,),
+                dtype=np.float32,
+            )
 
         if hasattr(env, "single_observation_space") and isinstance(
             env.single_observation_space, spaces.Dict
@@ -86,8 +109,9 @@ class DynamicStackCubeGoalPromptWrapper(gym.Wrapper):
 
     def observation(self, observation):
         obs = dict(observation)
-        obs["goal_prompt"] = self._compute_goal_prompt(obs).clone()
-        self._cached_goal_prompt = obs["goal_prompt"]
+        if self._cached_goal_prompt is None:
+            self._cached_goal_prompt = self._compute_goal_prompt(obs)
+        obs["goal_prompt"] = self._cached_goal_prompt.clone()
         return obs
 
     def _compute_goal_prompt(self, observation: dict) -> torch.Tensor:
@@ -106,32 +130,71 @@ class DynamicStackCubeGoalPromptWrapper(gym.Wrapper):
         width, height = self._get_camera_size(observation)
 
         batch_size = cubeA_pos.shape[0]
-        vec = torch.zeros(
-            (batch_size, self.prompt_raw_dim), dtype=torch.float32, device=device
-        )
 
-        write_idx = 0
-        for cam_name in self.prompt_cameras:
-            if cam_name not in sensor_params:
-                raise KeyError(
-                    f"Camera '{cam_name}' not found in sensor params. "
-                    f"Available cameras: {list(sensor_params.keys())}"
-                )
-            cam_param = sensor_params[cam_name]
-            intrinsic = self._to_tensor(cam_param["intrinsic_cv"], device)
-            extrinsic = self._to_tensor(cam_param["extrinsic_cv"], device)
+        if self.use_heatmap_prompt:
+            # Generate heatmap representation
+            centers_per_camera = []
+            for cam_name in self.prompt_cameras:
+                if cam_name not in sensor_params:
+                    raise KeyError(
+                        f"Camera '{cam_name}' not found in sensor params. "
+                        f"Available cameras: {list(sensor_params.keys())}"
+                    )
+                cam_param = sensor_params[cam_name]
+                intrinsic = self._to_tensor(cam_param["intrinsic_cv"], device)
+                extrinsic = self._to_tensor(cam_param["extrinsic_cv"], device)
 
-            init_center = self._project_world_points(cubeA_pos, intrinsic, extrinsic)
-            goal_center = self._project_world_points(goal_pos, intrinsic, extrinsic)
+                init_center = self._project_world_points(cubeA_pos, intrinsic, extrinsic)
+                goal_center = self._project_world_points(goal_pos, intrinsic, extrinsic)
 
-            vec[:, write_idx + 0] = (init_center[:, 0] / width).clamp(0.0, 1.0)
-            vec[:, write_idx + 1] = (init_center[:, 1] / height).clamp(0.0, 1.0)
-            vec[:, write_idx + 2] = (goal_center[:, 0] / width).clamp(0.0, 1.0)
-            vec[:, write_idx + 3] = (goal_center[:, 1] / height).clamp(0.0, 1.0)
-            write_idx += 4
+                # Normalize to [0, 1]
+                init_norm = torch.stack([
+                    (init_center[:, 0] / width).clamp(0.0, 1.0),
+                    (init_center[:, 1] / height).clamp(0.0, 1.0),
+                ], dim=-1)
+                goal_norm = torch.stack([
+                    (goal_center[:, 0] / width).clamp(0.0, 1.0),
+                    (goal_center[:, 1] / height).clamp(0.0, 1.0),
+                ], dim=-1)
+                
+                centers_per_camera.append((init_norm, goal_norm))
 
-        vec[:, -1] = 1.0
-        return vec
+            # Generate heatmaps (B, num_cameras*2, H, W)
+            heatmaps = bbox_centers_to_heatmap_multi_camera(
+                centers_per_camera,
+                heatmap_h=self.heatmap_h,
+                heatmap_w=self.heatmap_w,
+                sigma=self.heatmap_sigma,
+            )
+            return heatmaps
+        else:
+            # Generate vector representation (legacy)
+            vec = torch.zeros(
+                (batch_size, 4 * len(self.prompt_cameras) + 1), dtype=torch.float32, device=device
+            )
+
+            write_idx = 0
+            for cam_name in self.prompt_cameras:
+                if cam_name not in sensor_params:
+                    raise KeyError(
+                        f"Camera '{cam_name}' not found in sensor params. "
+                        f"Available cameras: {list(sensor_params.keys())}"
+                    )
+                cam_param = sensor_params[cam_name]
+                intrinsic = self._to_tensor(cam_param["intrinsic_cv"], device)
+                extrinsic = self._to_tensor(cam_param["extrinsic_cv"], device)
+
+                init_center = self._project_world_points(cubeA_pos, intrinsic, extrinsic)
+                goal_center = self._project_world_points(goal_pos, intrinsic, extrinsic)
+
+                vec[:, write_idx + 0] = (init_center[:, 0] / width).clamp(0.0, 1.0)
+                vec[:, write_idx + 1] = (init_center[:, 1] / height).clamp(0.0, 1.0)
+                vec[:, write_idx + 2] = (goal_center[:, 0] / width).clamp(0.0, 1.0)
+                vec[:, write_idx + 3] = (goal_center[:, 1] / height).clamp(0.0, 1.0)
+                write_idx += 4
+
+            vec[:, -1] = 1.0
+            return vec
 
     def _save_prompt_visualizations(self, observation: dict) -> None:
         if self.output_dir is None:

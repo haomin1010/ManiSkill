@@ -24,16 +24,26 @@ class FlattenRGBDObservationWrapper(gym.ObservationWrapper):
     always have a "state" key. If sep_depth is False, rgb and depth will be merged into a single "rgbd" key.
     """
 
-    def __init__(self, env, rgb=True, depth=True, state=True, sep_depth=True) -> None:
+    def __init__(self, env, rgb=True, depth=True, state=True, sep_depth=True, exclude_camera_names=None) -> None:
         self.base_env: BaseEnv = env.unwrapped
         super().__init__(env)
         self.include_rgb = rgb
         self.include_depth = depth
         self.sep_depth = sep_depth
         self.include_state = state
+        self.exclude_camera_names = set(exclude_camera_names or [])
 
         # check if rgb/depth data exists in first camera's sensor data
-        first_cam = next(iter(self.base_env._init_raw_obs["sensor_data"].values()))
+        first_cam = None
+        for cam_name, cam_data in self.base_env._init_raw_obs["sensor_data"].items():
+            if cam_name in self.exclude_camera_names:
+                continue
+            first_cam = cam_data
+            break
+        if first_cam is None:
+            raise ValueError(
+                f"No available cameras after excluding {sorted(self.exclude_camera_names)}"
+            )
         if "depth" not in first_cam:
             self.include_depth = False
         if "rgb" not in first_cam:
@@ -47,7 +57,9 @@ class FlattenRGBDObservationWrapper(gym.ObservationWrapper):
         del observation["sensor_param"]
         rgb_images = []
         depth_images = []
-        for cam_data in sensor_data.values():
+        for cam_name, cam_data in sensor_data.items():
+            if cam_name in self.exclude_camera_names:
+                continue
             if self.include_rgb:
                 rgb_images.append(cam_data["rgb"])
             if self.include_depth:

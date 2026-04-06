@@ -41,9 +41,14 @@ from diffusion_policy.plain_conv import PlainConv, ResNetEncoder
 from diffusion_policy.utils import (IterationBasedBatchSampler,
                                     build_state_obs_extractor, convert_obs,
                                     worker_init_fn)
+from diffusion_policy.heatmap_utils import bbox_centers_to_heatmap_multi_camera
 
 
-PROMPT_CAMERAS = ["base_camera", "left_side_camera", "right_side_camera"]
+CAMERA_SETTINGS = {
+    "base_left": ["base_camera", "left_side_camera"],
+    "left_right": ["left_side_camera", "right_side_camera"],
+}
+PROMPT_CAMERAS = CAMERA_SETTINGS["base_left"]
 
 
 @dataclass
@@ -68,7 +73,7 @@ class Args:
     env_id: str = "StackCube-v1"
     """the id of the environment"""
     demo_path: str = (
-        "videos_rgbd/stackcube_expert.rgbd.pd_ee_delta_pos.physx_cpu.h5"
+        "videos_rgbd/StackCube-v1/stackcube_expert.rgbd.pd_ee_delta_pos.physx_cpu.h5"
     )
     """the path of demo dataset, it is expected to be a ManiSkill dataset h5py format file"""
     num_demos: Optional[int] = 200
@@ -122,16 +127,29 @@ class Args:
     close_camera: bool = False
     """Use closer camera view (e.g. for StackCube). Must match the camera config used when recording demonstrations."""
 
+    camera_setting: str = "base_left"
+    """Which camera pair to use for visual inputs and prompts. Options: base_left, left_right."""
+
     # additional tags/configs for logging purposes to wandb and shared comparisons with other algorithms
     demo_type: Optional[str] = None
 
     # visual prompt conditioning (optional)
     use_visual_prompt: bool = True
     """Whether to condition policy on first-frame visual prompt (bbox/center) from prompt JSONs."""
-    prompt_dir: Optional[str] = "videos/StackCube-new/videos_0401/videos/StackCube-v1/screenshots"
+    prompt_dir: Optional[str] = "videos_rgbd/StackCube-v1/screenshots"
     """Directory containing ep{idx}_boxes_with_corners.json / ep{idx}_boxes.json files."""
+    use_heatmap_prompt: bool = True
+    """Use heatmap representation for visual prompt instead of vector encoding."""
+    heatmap_h: int = 48
+    """Height of heatmap."""
+    heatmap_w: int = 48
+    """Width of heatmap."""
+    heatmap_sigma: float = 0.0
+    """Gaussian sigma for heatmap generation. Set <=0 to auto-compute from resolution."""
+    heatmap_sigma_ratio: float = 0.1
+    """When heatmap_sigma<=0, effective_sigma = max(1.0, heatmap_sigma_ratio * min(H, W))."""
     prompt_embed_dim: int = 64
-    """Embedding dimension for visual prompt MLP."""
+    """Embedding dimension for visual prompt MLP (used if not using heatmap)."""
     prompt_dropout: float = 0.0
     """Dropout probability for prompt vector during training."""
     save_eval_prompt_viz: bool = False
@@ -152,6 +170,10 @@ class SmallDemoDataset_DiffusionPolicy(Dataset):  # Load everything into memory
     def __init__(self, data_path, obs_process_fn, obs_space, include_rgb, include_depth, device, num_traj):
         self.include_rgb = include_rgb
         self.include_depth = include_depth
+        self.use_heatmap_prompt = args.use_heatmap_prompt
+        self.heatmap_h = args.heatmap_h
+        self.heatmap_w = args.heatmap_w
+        self.heatmap_sigma = args.heatmap_sigma
         self._prompt_json_cache = {}
         self._prompt_episode_ids = None
         if args.use_visual_prompt:
@@ -370,53 +392,101 @@ class SmallDemoDataset_DiffusionPolicy(Dataset):  # Load everything into memory
         device,
     ):
         """
-        Build a fixed-size prompt vector:
-        For each camera in PROMPT_CAMERAS:
-        [init_cx, init_cy, goal_cx, goal_cy]
-        then append [has_prompt].
-        all normalized to [0, 1]. Strict mode: any missing field raises an error.
+        Build visual prompt from files. Can return either:
+        - Heatmap tensor (num_cameras*2, H, W) if use_heatmap_prompt=True
+        - Vector (4*num_cameras + 1,) if use_heatmap_prompt=False
+        
+        For heatmap: first and last channels are init/goal for cam0, middle channels for cam1, etc.
         """
-        vec = torch.zeros(4 * len(PROMPT_CAMERAS) + 1, dtype=torch.float32, device=device)
         if prompt_dir is None:
             raise ValueError("prompt_dir must be provided when use_visual_prompt=True")
 
         data = self._load_episode_prompt_json(prompt_dir, prompt_episode_id)
-
         cams = data.get("cameras", {})
         if len(cams) == 0:
             raise KeyError(f"No cameras found in prompt json for episode {traj_idx}")
-        write_idx = 0
-        for cam_name in PROMPT_CAMERAS:
-            cam_data = cams.get(cam_name)
-            if cam_data is None:
-                raise KeyError(
-                    f"Camera '{cam_name}' not found in prompt json for episode {prompt_episode_id} (traj_idx={traj_idx}). "
-                    f"Available cameras: {list(cams.keys())}"
+
+        if self.use_heatmap_prompt:
+            # Generate heatmap representation
+            centers_per_camera = []
+            for cam_name in PROMPT_CAMERAS:
+                cam_data = cams.get(cam_name)
+                if cam_data is None:
+                    raise KeyError(
+                        f"Camera '{cam_name}' not found in prompt json for episode {prompt_episode_id}"
+                    )
+
+                init_center = cam_data.get("init_center_px")
+                goal_center = cam_data.get("goal_center_px")
+                if init_center is None and isinstance(cam_data.get("init_box_corners"), dict):
+                    init_center = cam_data["init_box_corners"].get("center")
+                if goal_center is None and isinstance(cam_data.get("goal_box_corners"), dict):
+                    goal_center = cam_data["goal_box_corners"].get("center")
+                if init_center is None or goal_center is None:
+                    raise KeyError(
+                        f"Missing init/goal center for episode {prompt_episode_id} (traj_idx={traj_idx}), camera '{cam_name}'"
+                    )
+
+                H, W = self._get_camera_hw(raw_obs_traj_dict, cam_name)
+                if H <= 0 or W <= 0:
+                    raise ValueError(f"Invalid image size for prompt camera '{cam_name}': H={H}, W={W}")
+
+                # Normalize to [0, 1]
+                init_norm = torch.tensor(
+                    [float(init_center[0]) / W, float(init_center[1]) / H],
+                    dtype=torch.float32,
+                    device=device,
                 )
-
-            init_center = cam_data.get("init_center_px")
-            goal_center = cam_data.get("goal_center_px")
-            if init_center is None and isinstance(cam_data.get("init_box_corners"), dict):
-                init_center = cam_data["init_box_corners"].get("center")
-            if goal_center is None and isinstance(cam_data.get("goal_box_corners"), dict):
-                goal_center = cam_data["goal_box_corners"].get("center")
-            if init_center is None or goal_center is None:
-                raise KeyError(
-                    f"Missing init/goal center for episode {prompt_episode_id} (traj_idx={traj_idx}), camera '{cam_name}'"
+                goal_norm = torch.tensor(
+                    [float(goal_center[0]) / W, float(goal_center[1]) / H],
+                    dtype=torch.float32,
+                    device=device,
                 )
+                centers_per_camera.append((init_norm.unsqueeze(0), goal_norm.unsqueeze(0)))
 
-            H, W = self._get_camera_hw(raw_obs_traj_dict, cam_name)
-            if H <= 0 or W <= 0:
-                raise ValueError(f"Invalid image size for prompt camera '{cam_name}': H={H}, W={W}")
+            # Generate multi-camera heatmaps (1, num_cameras*2, H, W)
+            heatmaps = bbox_centers_to_heatmap_multi_camera(
+                centers_per_camera,
+                heatmap_h=self.heatmap_h,
+                heatmap_w=self.heatmap_w,
+                sigma=self.heatmap_sigma,
+            )
+            return heatmaps[0]  # Remove batch dim: (num_cameras*2, H, W)
+        else:
+            # Generate vector representation (legacy)
+            vec = torch.zeros(4 * len(PROMPT_CAMERAS) + 1, dtype=torch.float32, device=device)
+            write_idx = 0
+            for cam_name in PROMPT_CAMERAS:
+                cam_data = cams.get(cam_name)
+                if cam_data is None:
+                    raise KeyError(
+                        f"Camera '{cam_name}' not found in prompt json for episode {prompt_episode_id} (traj_idx={traj_idx}). "
+                        f"Available cameras: {list(cams.keys())}"
+                    )
 
-            vec[write_idx + 0] = float(init_center[0]) / W
-            vec[write_idx + 1] = float(init_center[1]) / H
-            vec[write_idx + 2] = float(goal_center[0]) / W
-            vec[write_idx + 3] = float(goal_center[1]) / H
-            write_idx += 4
+                init_center = cam_data.get("init_center_px")
+                goal_center = cam_data.get("goal_center_px")
+                if init_center is None and isinstance(cam_data.get("init_box_corners"), dict):
+                    init_center = cam_data["init_box_corners"].get("center")
+                if goal_center is None and isinstance(cam_data.get("goal_box_corners"), dict):
+                    goal_center = cam_data["goal_box_corners"].get("center")
+                if init_center is None or goal_center is None:
+                    raise KeyError(
+                        f"Missing init/goal center for episode {prompt_episode_id} (traj_idx={traj_idx}), camera '{cam_name}'"
+                    )
 
-        vec[-1] = 1.0
-        return vec
+                H, W = self._get_camera_hw(raw_obs_traj_dict, cam_name)
+                if H <= 0 or W <= 0:
+                    raise ValueError(f"Invalid image size for prompt camera '{cam_name}': H={H}, W={W}")
+
+                vec[write_idx + 0] = float(init_center[0]) / W
+                vec[write_idx + 1] = float(init_center[1]) / H
+                vec[write_idx + 2] = float(goal_center[0]) / W
+                vec[write_idx + 3] = float(goal_center[1]) / H
+                write_idx += 4
+
+            vec[-1] = 1.0
+            return vec
 
     @staticmethod
     def _get_camera_hw(raw_obs_traj_dict: dict, cam_name: str):
@@ -484,7 +554,15 @@ class Agent(nn.Module):
         self.act_horizon = args.act_horizon
         self.pred_horizon = args.pred_horizon
         self.use_visual_prompt = args.use_visual_prompt
-        self.prompt_raw_dim = 4 * len(PROMPT_CAMERAS) + 1
+        self.use_heatmap_prompt = args.use_heatmap_prompt if args.use_visual_prompt else False
+        self.heatmap_h = args.heatmap_h
+        self.heatmap_w = args.heatmap_w
+        
+        if self.use_heatmap_prompt:
+            self.heatmap_channels = 2 * len(PROMPT_CAMERAS)  # init + goal for each camera
+        else:
+            self.prompt_raw_dim = 4 * len(PROMPT_CAMERAS) + 1
+        
         assert (
             len(env.single_observation_space["state"].shape) == 2
         )  # (obs_horizon, obs_dim)
@@ -521,13 +599,33 @@ class Agent(nn.Module):
             )
             print(f"[encoder] Using PlainConv encoder (in_channels={total_visual_channels}, out_dim={visual_feature_dim})")
 
-        prompt_cond_dim = args.prompt_embed_dim if self.use_visual_prompt else 0
+        prompt_cond_dim = 0
         if self.use_visual_prompt:
-            self.prompt_encoder = nn.Sequential(
-                nn.Linear(self.prompt_raw_dim, 128),
-                nn.ReLU(inplace=True),
-                nn.Linear(128, args.prompt_embed_dim),
-            )
+            if self.use_heatmap_prompt:
+                # Use a simple CNN to encode heatmaps into feature vectors
+                # Heatmap shape: (heatmap_channels, heatmap_h, heatmap_w)
+                self.heatmap_encoder = nn.Sequential(
+                    nn.Conv2d(self.heatmap_channels, 32, kernel_size=3, padding=1),
+                    nn.ReLU(inplace=True),
+                    nn.MaxPool2d(kernel_size=2),  # (H/2, W/2)
+                    nn.Conv2d(32, 64, kernel_size=3, padding=1),
+                    nn.ReLU(inplace=True),
+                    nn.MaxPool2d(kernel_size=2),  # (H/4, W/4)
+                    nn.AdaptiveAvgPool2d(1),  # (1, 1)
+                    nn.Flatten(),
+                    nn.Linear(64, args.prompt_embed_dim),
+                )
+                prompt_cond_dim = args.prompt_embed_dim
+                print(f"[prompt] Using heatmap encoder (channels={self.heatmap_channels}, H={self.heatmap_h}, W={self.heatmap_w}, embed_dim={args.prompt_embed_dim})")
+            else:
+                # Use MLP to encode bbox vector
+                self.prompt_encoder = nn.Sequential(
+                    nn.Linear(self.prompt_raw_dim, 128),
+                    nn.ReLU(inplace=True),
+                    nn.Linear(128, args.prompt_embed_dim),
+                )
+                prompt_cond_dim = args.prompt_embed_dim
+                print(f"[prompt] Using vector encoder (dim={self.prompt_raw_dim} -> {args.prompt_embed_dim})")
 
         self.noise_pred_net = ConditionalUnet1D(
             input_dim=self.act_dim,  # act_horizon is not used (U-Net doesn't care)
@@ -569,25 +667,43 @@ class Agent(nn.Module):
         if not self.use_visual_prompt:
             return obs_cond
 
-        if goal_prompt is None:
-            goal_prompt = torch.zeros(
-                (batch_size, self.prompt_raw_dim),
-                dtype=obs_cond.dtype,
-                device=obs_cond.device,
-            )
+        if self.use_heatmap_prompt:
+            # Handle heatmap prompt
+            if goal_prompt is None:
+                goal_prompt = torch.zeros(
+                    (batch_size, self.heatmap_channels, self.heatmap_h, self.heatmap_w),
+                    dtype=obs_cond.dtype,
+                    device=obs_cond.device,
+                )
+            else:
+                if goal_prompt.ndim == 3:
+                    goal_prompt = goal_prompt.unsqueeze(0)
+                goal_prompt = goal_prompt.to(device=obs_cond.device, dtype=obs_cond.dtype)
+
+            # Apply heatmap encoder
+            prompt_cond = self.heatmap_encoder(goal_prompt)  # (B, prompt_embed_dim)
         else:
-            if goal_prompt.ndim == 1:
-                goal_prompt = goal_prompt.unsqueeze(0)
-            goal_prompt = goal_prompt.to(device=obs_cond.device, dtype=obs_cond.dtype)
+            # Handle vector prompt
+            if goal_prompt is None:
+                goal_prompt = torch.zeros(
+                    (batch_size, self.prompt_raw_dim),
+                    dtype=obs_cond.dtype,
+                    device=obs_cond.device,
+                )
+            else:
+                if goal_prompt.ndim == 1:
+                    goal_prompt = goal_prompt.unsqueeze(0)
+                goal_prompt = goal_prompt.to(device=obs_cond.device, dtype=obs_cond.dtype)
 
-        if (not eval_mode) and self.args.prompt_dropout > 0:
-            keep_mask = (
-                torch.rand((batch_size, 1), device=obs_cond.device)
-                > self.args.prompt_dropout
-            ).to(obs_cond.dtype)
-            goal_prompt = goal_prompt * keep_mask
+            if (not eval_mode) and self.args.prompt_dropout > 0:
+                keep_mask = (
+                    torch.rand((batch_size, 1), device=obs_cond.device)
+                    > self.args.prompt_dropout
+                ).to(obs_cond.dtype)
+                goal_prompt = goal_prompt * keep_mask
 
-        prompt_cond = self.prompt_encoder(goal_prompt)
+            prompt_cond = self.prompt_encoder(goal_prompt)  # (B, prompt_embed_dim)
+
         return torch.cat([obs_cond, prompt_cond], dim=-1)
 
     def compute_loss(self, obs_seq, action_seq, goal_prompt=None):
@@ -676,6 +792,23 @@ def save_ckpt(run_name, tag):
 if __name__ == "__main__":
     args = tyro.cli(Args)
 
+    if args.camera_setting not in CAMERA_SETTINGS:
+        raise ValueError(f"camera_setting must be one of {sorted(CAMERA_SETTINGS.keys())}, got {args.camera_setting}")
+    PROMPT_CAMERAS = CAMERA_SETTINGS[args.camera_setting]
+
+    if args.use_heatmap_prompt:
+        if args.heatmap_h <= 0 or args.heatmap_w <= 0:
+            raise ValueError("heatmap_h and heatmap_w must be positive")
+        if args.heatmap_sigma <= 0:
+            args.heatmap_sigma = max(
+                1.0, float(args.heatmap_sigma_ratio) * float(min(args.heatmap_h, args.heatmap_w))
+            )
+            print(
+                f"[heatmap] auto sigma enabled: sigma={args.heatmap_sigma:.3f} "
+                f"for resolution {args.heatmap_h}x{args.heatmap_w} "
+                f"(ratio={args.heatmap_sigma_ratio})"
+            )
+
     if args.use_visual_prompt and not args.prompt_dir:
         raise ValueError("--use-visual-prompt requires --prompt-dir (strict mode, no fallback)")
 
@@ -714,6 +847,9 @@ if __name__ == "__main__":
     # create evaluation environment
     # sensor_configs resizes all cameras to 128×128 to avoid concat failures
     # when cameras have different resolutions (e.g. hand_camera=128 vs base_camera=512)
+    excluded_camera_names = {"hand_camera"}
+    all_camera_names = {"base_camera", "left_side_camera", "right_side_camera"}
+    excluded_camera_names |= all_camera_names - set(PROMPT_CAMERAS)
     env_kwargs = dict(
         control_mode=args.control_mode,
         reward_mode="sparse",
@@ -721,6 +857,7 @@ if __name__ == "__main__":
         render_mode="rgb_array",
         human_render_camera_configs=dict(shader_pack="default"),
         sensor_configs=dict(width=128, height=128),
+        robot_uids="panda_wristcam",
     )
     assert args.max_episode_steps is not None, "max_episode_steps must be specified as imitation learning algorithms task solve speed is dependent on the data you train on"
     env_kwargs["max_episode_steps"] = args.max_episode_steps
@@ -735,15 +872,20 @@ if __name__ == "__main__":
     if args.close_camera:
         env_kwargs["close_camera"] = True
     other_kwargs = dict(obs_horizon=args.obs_horizon)
-    eval_wrappers = [FlattenRGBDObservationWrapper]
+    eval_wrappers = [partial(FlattenRGBDObservationWrapper, exclude_camera_names=excluded_camera_names)]
     if args.use_visual_prompt:
         eval_prompt_viz_dir = f"runs/{run_name}/prompt_viz" if args.save_eval_prompt_viz else None
         eval_wrappers = [
-            FlattenRGBDObservationWrapper,
+            partial(FlattenRGBDObservationWrapper, exclude_camera_names=excluded_camera_names),
             partial(
                 DynamicStackCubeGoalPromptWrapper,
                 output_dir=eval_prompt_viz_dir,
                 save_visualizations=args.save_eval_prompt_viz,
+                use_heatmap_prompt=args.use_heatmap_prompt,
+                heatmap_h=args.heatmap_h,
+                heatmap_w=args.heatmap_w,
+                heatmap_sigma=args.heatmap_sigma,
+                prompt_cameras=PROMPT_CAMERAS,
             ),
         ]
 
@@ -787,6 +929,7 @@ if __name__ == "__main__":
         state_obs_extractor=build_state_obs_extractor(args.env_id),
         rgb=(args.obs_mode in {"rgb", "rgb+depth"}),
         depth=(args.obs_mode in {"depth", "rgb+depth"}),
+        exclude_camera_names=excluded_camera_names,
     )
 
     # create temporary env to get original observation space as AsyncVectorEnv (CPU parallelization) doesn't permit that
