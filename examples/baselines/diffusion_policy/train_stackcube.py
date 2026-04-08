@@ -127,7 +127,7 @@ class Args:
     close_camera: bool = False
     """Use closer camera view (e.g. for StackCube). Must match the camera config used when recording demonstrations."""
 
-    camera_setting: str = "base_left"
+    camera_setting: str = "left_right"
     """Which camera pair to use for visual inputs and prompts. Options: base_left, left_right."""
 
     # additional tags/configs for logging purposes to wandb and shared comparisons with other algorithms
@@ -148,7 +148,7 @@ class Args:
     """Gaussian sigma for heatmap generation. Set <=0 to auto-compute from resolution."""
     heatmap_sigma_ratio: float = 0.1
     """When heatmap_sigma<=0, effective_sigma = max(1.0, heatmap_sigma_ratio * min(H, W))."""
-    prompt_embed_dim: int = 64
+    prompt_embed_dim: int = 128
     """Embedding dimension for visual prompt MLP (used if not using heatmap)."""
     prompt_dropout: float = 0.0
     """Dropout probability for prompt vector during training."""
