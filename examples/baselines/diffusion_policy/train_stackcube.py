@@ -73,7 +73,7 @@ class Args:
     env_id: str = "StackCube-v1"
     """the id of the environment"""
     demo_path: str = (
-        "videos_rgbd/StackCube-v1/stackcube_expert.rgbd.pd_ee_delta_pose.physx_cpu.h5"
+        "videos/StackCube-v1/stackcube_expert.rgbd.pd_ee_delta_pose.physx_cpu.h5"
     )
     """the path of demo dataset, it is expected to be a ManiSkill dataset h5py format file"""
     num_demos: Optional[int] = 20
@@ -136,7 +136,7 @@ class Args:
     # visual prompt conditioning (optional)
     use_visual_prompt: bool = True
     """Whether to condition policy on first-frame visual prompt (bbox/center) from prompt JSONs."""
-    prompt_dir: Optional[str] = "videos_rgbd/StackCube-v1/screenshots"
+    prompt_dir: Optional[str] = "videos/StackCube-v1/screenshots"
     """Directory containing ep{idx}_boxes_with_corners.json / ep{idx}_boxes.json files."""
     use_heatmap_prompt: bool = True
     """Use heatmap representation for visual prompt instead of vector encoding."""
