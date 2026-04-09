@@ -73,10 +73,10 @@ class Args:
     env_id: str = "StackCube-v1"
     """the id of the environment"""
     demo_path: str = (
-        "videos_rgbd/StackCube-v1/stackcube_expert.rgbd.pd_ee_delta_pos.physx_cpu.h5"
+        "videos_rgbd/StackCube-v1/stackcube_expert.rgbd.pd_ee_delta_pose.physx_cpu.h5"
     )
     """the path of demo dataset, it is expected to be a ManiSkill dataset h5py format file"""
-    num_demos: Optional[int] = 200
+    num_demos: Optional[int] = 20
     """number of trajectories to load from the demo dataset"""
     total_iters: int = 500_000
     """total timesteps of the experiment"""
@@ -122,7 +122,7 @@ class Args:
     """the simulation backend to use for evaluation environments. can be "physx_cpu" or "gpu" """
     num_dataload_workers: int = 0
     """the number of workers to use for loading the training data in the torch dataloader"""
-    control_mode: str = "pd_ee_delta_pos"
+    control_mode: str = "pd_ee_delta_pose"
     """the control mode to use for the evaluation environments. Must match the control mode of the demonstration dataset."""
     close_camera: bool = False
     """Use closer camera view (e.g. for StackCube). Must match the camera config used when recording demonstrations."""
