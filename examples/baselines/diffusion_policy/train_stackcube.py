@@ -45,8 +45,6 @@ from diffusion_policy.heatmap_utils import bbox_centers_to_heatmap_multi_camera
 
 
 CAMERA_SETTINGS = {
-    "left_only": ["left_side_camera"],
-    "right_only": ["right_side_camera"],
     "base_left": ["base_camera", "left_side_camera"],
     "left_right": ["left_side_camera", "right_side_camera"],
 }
@@ -75,10 +73,10 @@ class Args:
     env_id: str = "StackCube-v1"
     """the id of the environment"""
     demo_path: str = (
-        "videos_rgbd/StackCube-v1/stackcube_expert.rgbd.pd_ee_delta_pos.physx_cpu.h5"
+        "videos/StackCube-v1/stackcube_expert.rgbd.pd_ee_delta_pose.physx_cpu.h5"
     )
     """the path of demo dataset, it is expected to be a ManiSkill dataset h5py format file"""
-    num_demos: Optional[int] = 200
+    num_demos: Optional[int] = 198
     """number of trajectories to load from the demo dataset"""
     total_iters: int = 500_000
     """total timesteps of the experiment"""
@@ -124,7 +122,7 @@ class Args:
     """the simulation backend to use for evaluation environments. can be "physx_cpu" or "gpu" """
     num_dataload_workers: int = 0
     """the number of workers to use for loading the training data in the torch dataloader"""
-    control_mode: str = "pd_ee_delta_pos"
+    control_mode: str = "pd_ee_delta_pose"
     """the control mode to use for the evaluation environments. Must match the control mode of the demonstration dataset."""
     close_camera: bool = False
     """Use closer camera view (e.g. for StackCube). Must match the camera config used when recording demonstrations."""
@@ -138,12 +136,10 @@ class Args:
     # visual prompt conditioning (optional)
     use_visual_prompt: bool = True
     """Whether to condition policy on first-frame visual prompt (bbox/center) from prompt JSONs."""
-    prompt_dir: Optional[str] = "videos_rgbd/StackCube-v1/screenshots"
+    prompt_dir: Optional[str] = "videos/StackCube-v1/screenshots"
     """Directory containing ep{idx}_boxes_with_corners.json / ep{idx}_boxes.json files."""
     use_heatmap_prompt: bool = True
     """Use heatmap representation for visual prompt instead of vector encoding."""
-    heatmap_as_visual_channel: bool = False
-    """If True and use_heatmap_prompt=True, concatenate goal heatmaps to visual channels (ALOHA-style) instead of using a separate prompt encoder."""
     heatmap_h: int = 48
     """Height of heatmap."""
     heatmap_w: int = 48
@@ -559,20 +555,13 @@ class Agent(nn.Module):
         self.pred_horizon = args.pred_horizon
         self.use_visual_prompt = args.use_visual_prompt
         self.use_heatmap_prompt = args.use_heatmap_prompt if args.use_visual_prompt else False
-        self.heatmap_as_visual_channel = (
-            args.heatmap_as_visual_channel if self.use_heatmap_prompt else False
-        )
-        self.camera_setting = args.camera_setting
-        self.prompt_cameras = CAMERA_SETTINGS[self.camera_setting]
         self.heatmap_h = args.heatmap_h
         self.heatmap_w = args.heatmap_w
-
-        self._single_view_idx = self._get_single_view_index(self.camera_setting)
         
         if self.use_heatmap_prompt:
-            self.heatmap_channels = 2 * len(self.prompt_cameras)  # init + goal for each camera
+            self.heatmap_channels = 2 * len(PROMPT_CAMERAS)  # init + goal for each camera
         else:
-            self.prompt_raw_dim = 4 * len(self.prompt_cameras) + 1
+            self.prompt_raw_dim = 4 * len(PROMPT_CAMERAS) + 1
         
         assert (
             len(env.single_observation_space["state"].shape) == 2
@@ -595,10 +584,6 @@ class Agent(nn.Module):
         if self.include_depth:
             total_visual_channels += env.single_observation_space["depth"].shape[-1]
 
-        if self.use_visual_prompt and self.use_heatmap_prompt and self.heatmap_as_visual_channel:
-            # ALOHA-style: append one goal-heatmap channel per prompt camera to visual input.
-            total_visual_channels += len(self.prompt_cameras)
-
         visual_feature_dim = args.visual_feature_dim
         encoder_type = getattr(args, "encoder", "plainconv").lower()
         if encoder_type == "resnet18":
@@ -616,7 +601,7 @@ class Agent(nn.Module):
 
         prompt_cond_dim = 0
         if self.use_visual_prompt:
-            if self.use_heatmap_prompt and (not self.heatmap_as_visual_channel):
+            if self.use_heatmap_prompt:
                 # Use a simple CNN to encode heatmaps into feature vectors
                 # Heatmap shape: (heatmap_channels, heatmap_h, heatmap_w)
                 self.heatmap_encoder = nn.Sequential(
@@ -632,11 +617,6 @@ class Agent(nn.Module):
                 )
                 prompt_cond_dim = args.prompt_embed_dim
                 print(f"[prompt] Using heatmap encoder (channels={self.heatmap_channels}, H={self.heatmap_h}, W={self.heatmap_w}, embed_dim={args.prompt_embed_dim})")
-            elif self.use_heatmap_prompt and self.heatmap_as_visual_channel:
-                print(
-                    f"[prompt] Using heatmap-as-visual-channel mode "
-                    f"(append {len(self.prompt_cameras)} goal-heatmap channels to image input)"
-                )
             else:
                 # Use MLP to encode bbox vector
                 self.prompt_encoder = nn.Sequential(
@@ -671,34 +651,6 @@ class Agent(nn.Module):
             img_seq = depth
         if self.include_rgb and self.include_depth:
             img_seq = torch.cat([rgb, depth], dim=2)  # (B, obs_horizon, C, H, W), C=4*k
-
-        img_seq = self._select_visual_view(img_seq)
-
-        if self.use_visual_prompt and self.use_heatmap_prompt and self.heatmap_as_visual_channel:
-            # goal_prompt expected shape: (B, 2*num_cameras, Hh, Wh)
-            # We only append goal channels (idx 1,3,5,...) -> one channel per camera.
-            B, T, _, H, W = img_seq.shape
-            if goal_prompt is None:
-                goal_maps = torch.zeros(
-                    (B, len(self.prompt_cameras), self.heatmap_h, self.heatmap_w),
-                    dtype=img_seq.dtype,
-                    device=img_seq.device,
-                )
-            else:
-                if goal_prompt.ndim == 3:
-                    goal_prompt = goal_prompt.unsqueeze(0)
-                goal_prompt = goal_prompt.to(device=img_seq.device, dtype=img_seq.dtype)
-                goal_maps = goal_prompt[:, 1::2, :, :]  # (B, num_cameras, Hh, Wh)
-                goal_maps = self._select_prompt_views(goal_maps)
-
-            goal_maps = self._select_prompt_views(goal_maps)
-
-            if goal_maps.shape[-2:] != (H, W):
-                goal_maps = F.interpolate(goal_maps, size=(H, W), mode="bilinear", align_corners=False)
-
-            goal_maps = goal_maps.unsqueeze(1).expand(-1, T, -1, -1, -1)  # (B, T, num_cams, H, W)
-            img_seq = torch.cat([img_seq, goal_maps], dim=2)
-
         batch_size = img_seq.shape[0]
         img_seq = img_seq.flatten(end_dim=1)  # (B*obs_horizon, C, H, W)
         if hasattr(self, "aug") and not eval_mode:
@@ -715,11 +667,7 @@ class Agent(nn.Module):
         if not self.use_visual_prompt:
             return obs_cond
 
-        if self.use_heatmap_prompt and self.heatmap_as_visual_channel:
-            # Prompt information is already fused into visual channels.
-            return obs_cond
-
-        if self.use_heatmap_prompt and (not self.heatmap_as_visual_channel):
+        if self.use_heatmap_prompt:
             # Handle heatmap prompt
             if goal_prompt is None:
                 goal_prompt = torch.zeros(
@@ -731,7 +679,6 @@ class Agent(nn.Module):
                 if goal_prompt.ndim == 3:
                     goal_prompt = goal_prompt.unsqueeze(0)
                 goal_prompt = goal_prompt.to(device=obs_cond.device, dtype=obs_cond.dtype)
-                goal_prompt = self._select_prompt_views(goal_prompt)
 
             # Apply heatmap encoder
             prompt_cond = self.heatmap_encoder(goal_prompt)  # (B, prompt_embed_dim)
@@ -747,7 +694,6 @@ class Agent(nn.Module):
                 if goal_prompt.ndim == 1:
                     goal_prompt = goal_prompt.unsqueeze(0)
                 goal_prompt = goal_prompt.to(device=obs_cond.device, dtype=obs_cond.dtype)
-                goal_prompt = self._select_vector_prompt_views(goal_prompt)
 
             if (not eval_mode) and self.args.prompt_dropout > 0:
                 keep_mask = (
@@ -830,113 +776,6 @@ class Agent(nn.Module):
             actions = (actions + 1.0) / 2.0 * act_range + self.action_min
         return actions  # (B, act_horizon, act_dim)
 
-    @staticmethod
-    def _get_single_view_index(camera_setting: str):
-        if camera_setting in {"left_only", "base_only"}:
-            return 0
-        if camera_setting == "right_only":
-            return 1
-        return None
-
-    def _select_visual_view(self, img_seq: torch.Tensor) -> torch.Tensor:
-        if self._single_view_idx is None:
-            return img_seq
-        if img_seq.shape[2] <= self._single_view_idx:
-            return img_seq
-        return img_seq[:, :, self._single_view_idx : self._single_view_idx + 1]
-
-    def _select_prompt_views(self, prompt: torch.Tensor) -> torch.Tensor:
-        if self._single_view_idx is None:
-            return prompt
-        if prompt.shape[1] <= self._single_view_idx:
-            return prompt
-        return prompt[:, self._single_view_idx : self._single_view_idx + 1]
-
-    def _select_vector_prompt_views(self, prompt: torch.Tensor) -> torch.Tensor:
-        if self._single_view_idx is None:
-            return prompt
-        # Vector prompt layout: [init_x, init_y, goal_x, goal_y] * num_cameras + [1]
-        prompt_no_flag = prompt[:, :-1]
-        if prompt_no_flag.shape[1] < (self._single_view_idx + 1) * 4:
-            return prompt
-        start = self._single_view_idx * 4
-        selected = prompt_no_flag[:, start : start + 4]
-        return torch.cat([selected, prompt[:, -1:]], dim=-1)
-
-
-class MultiViewActionAggregationAgent(nn.Module):
-    """Ensemble several single-view agents by averaging their diffusion noise predictions.
-
-    This keeps the original single-agent training/evaluation path intact while enabling
-    multi-view action aggregation at inference time.
-    """
-
-    def __init__(self, agents: List[Agent]):
-        super().__init__()
-        if len(agents) < 2:
-            raise ValueError("MultiViewActionAggregationAgent requires at least two agents")
-        self.agents = nn.ModuleList(agents)
-        ref = agents[0]
-        self.noise_scheduler = ref.noise_scheduler
-        self.obs_horizon = ref.obs_horizon
-        self.pred_horizon = ref.pred_horizon
-        self.act_horizon = ref.act_horizon
-        self.act_dim = ref.act_dim
-        self.action_normed = ref.action_normed
-        self.register_buffer("action_min", ref.action_min.detach().clone())
-        self.register_buffer("action_max", ref.action_max.detach().clone())
-
-    def train(self, mode: bool = True):
-        for agent in self.agents:
-            agent.train(mode)
-        return super().train(mode)
-
-    def eval(self):
-        for agent in self.agents:
-            agent.eval()
-        return super().eval()
-
-    def get_action(self, obs_seq, goal_prompt=None):
-        B = obs_seq["state"].shape[0]
-        with torch.no_grad():
-            obs_conds = []
-            for agent in self.agents:
-                local_obs = dict(obs_seq)
-                if agent.include_rgb:
-                    local_obs["rgb"] = local_obs["rgb"].permute(0, 1, 4, 2, 3)
-                if agent.include_depth:
-                    local_obs["depth"] = local_obs["depth"].permute(0, 1, 4, 2, 3)
-                obs_conds.append(agent.encode_obs(local_obs, eval_mode=True, goal_prompt=goal_prompt))
-
-            noisy_action_seq = torch.randn(
-                (B, self.pred_horizon, self.act_dim), device=obs_seq["state"].device
-            )
-
-            for k in self.noise_scheduler.timesteps:
-                noise_preds = []
-                for agent, obs_cond in zip(self.agents, obs_conds):
-                    noise_preds.append(
-                        agent.noise_pred_net(
-                            sample=noisy_action_seq,
-                            timestep=k,
-                            global_cond=obs_cond,
-                        )
-                    )
-                noise_pred = torch.stack(noise_preds, dim=0).mean(dim=0)
-                noisy_action_seq = self.noise_scheduler.step(
-                    model_output=noise_pred,
-                    timestep=k,
-                    sample=noisy_action_seq,
-                ).prev_sample
-
-        start = self.obs_horizon - 1
-        end = start + self.act_horizon
-        actions = noisy_action_seq[:, start:end]
-        if self.action_normed:
-            act_range = (self.action_max - self.action_min).clamp(min=1e-8)
-            actions = (actions + 1.0) / 2.0 * act_range + self.action_min
-        return actions
-
 
 def save_ckpt(run_name, tag):
     os.makedirs(f"runs/{run_name}/checkpoints", exist_ok=True)
@@ -969,9 +808,6 @@ if __name__ == "__main__":
                 f"for resolution {args.heatmap_h}x{args.heatmap_w} "
                 f"(ratio={args.heatmap_sigma_ratio})"
             )
-
-    if args.heatmap_as_visual_channel and (not args.use_heatmap_prompt):
-        raise ValueError("--heatmap-as-visual-channel requires --use-heatmap-prompt")
 
     if args.use_visual_prompt and not args.prompt_dir:
         raise ValueError("--use-visual-prompt requires --prompt-dir (strict mode, no fallback)")
