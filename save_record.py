@@ -2,6 +2,7 @@ import argparse
 from pathlib import Path
 import json
 import shutil
+import warnings
 
 import numpy as np
 from PIL import Image
@@ -194,6 +195,12 @@ def main():
         action="store_true",
         help="检测到碰撞时直接删除视频，而非移动到 collision/ 目录。",
     )
+    parser.add_argument(
+        "--balanced-preplaced-0to9",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="按 0~9 均匀分配额外已摆好方块数量（10*n 条时每档 n 条）。",
+    )
     args = parser.parse_args()
 
     output_dir = Path("videos/StackCube-v1")
@@ -232,13 +239,22 @@ def main():
     # [DEBUG] 数据生成阶段：首次 reset 后打印相机列表（将写入 H5 的 sensor_data）
     _first_reset_done = False
 
+    if args.balanced_preplaced_0to9 and args.num_episodes % 10 != 0:
+        warnings.warn(
+            f"--num-episodes={args.num_episodes} 不是 10 的倍数；将按 0~9 循环分配，"
+            "仅在 10*n 时严格满足每档数量完全一致。"
+        )
+
     for ep in range(args.num_episodes):
         if args.base_seed is not None:
             ep_seed = int(args.base_seed) + ep
         else:
             ep_seed = None
 
-        obs, info = env.reset(seed=ep_seed)
+        reset_options = None
+        if args.balanced_preplaced_0to9:
+            reset_options = {"preplaced_count": int(ep % 10)}
+        obs, info = env.reset(seed=ep_seed, options=reset_options)
 
         if not _first_reset_done:
             cams = [c for c in obs.get("sensor_data", {}) if "rgb" in obs["sensor_data"].get(c, {})]
@@ -275,7 +291,8 @@ def main():
 
         print(
             f"episode {ep}, seed={ep_seed}, home_steps={home_steps}, "
-            f"success={res}, collision={collision}"
+            f"success={res}, collision={collision}, "
+            f"preplaced_count={reset_options['preplaced_count'] if reset_options else 'random'}"
         )
         if collision:
             collision_episodes.append(ep)
@@ -287,6 +304,7 @@ def main():
             "success": bool(res),
             "collision": collision,
             "displacements": displacements,
+            "preplaced_count": int(reset_options["preplaced_count"]) if reset_options else None,
         }
 
     env.close()
@@ -337,4 +355,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

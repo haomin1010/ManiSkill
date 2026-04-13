@@ -7,7 +7,6 @@ import torch
 
 from mani_skill.agents.robots import Fetch, Panda
 from mani_skill.envs.sapien_env import BaseEnv
-from mani_skill.envs.utils import randomization
 from mani_skill.sensors.camera import CameraConfig
 from mani_skill.utils import common, sapien_utils
 from mani_skill.utils.building import actors
@@ -288,14 +287,41 @@ class StackCubeEnv(BaseEnv):
         with torch.device(self.device):
             b = len(env_idx)
             self.table_scene.initialize(env_idx)
+            options = options or {}
 
-            # 先采样堆叠规模与散落块数量，保证 cubeA + 堆叠 + 散落 <= _MAX_TASK_CUBES
-            num_green = torch.randint(
-                low=1,
-                high=self.max_green_cubes + 1,
-                size=(1,),
-                device=self.device,
-            ).item()
+            # 可选地由外部指定“额外已摆好方块数量”（不含 cubeA / cubeB），用于构造 0~9 的均匀分布数据。
+            forced_preplaced = options.get("preplaced_count", None)
+            if forced_preplaced is not None:
+                extra_total = int(forced_preplaced)
+                extra_total = max(0, min(9, extra_total))
+                max_stack_extra = self.max_green_cubes - 1
+                min_stack_extra = max(0, extra_total - self._MAX_SCATTERED_CUBES)
+                max_stack_extra = min(max_stack_extra, extra_total)
+                if min_stack_extra <= max_stack_extra:
+                    stack_extra = int(self._episode_rng.randint(min_stack_extra, max_stack_extra + 1))
+                else:
+                    stack_extra = max_stack_extra
+                num_green = 1 + stack_extra
+                num_extra_scattered = extra_total - stack_extra
+            else:
+                # 默认随机逻辑：采样堆叠规模与散落块数量，保证 cubeA + 堆叠 + 散落 <= _MAX_TASK_CUBES
+                num_green = torch.randint(
+                    low=1,
+                    high=self.max_green_cubes + 1,
+                    size=(1,),
+                    device=self.device,
+                ).item()
+                max_extra = self._MAX_TASK_CUBES - 1 - num_green
+                max_extra = max(0, min(max_extra, self._MAX_SCATTERED_CUBES))
+                re = self._episode_rng
+                if max_extra <= 0:
+                    num_extra_scattered = 0
+                elif max_extra == 1:
+                    num_extra_scattered = int(re.randint(0, 2))
+                else:
+                    low = 2
+                    num_extra_scattered = int(re.randint(low, max_extra + 1))
+
             max_layers = min(3, num_green)
             num_layers = torch.randint(
                 low=1,
@@ -303,16 +329,6 @@ class StackCubeEnv(BaseEnv):
                 size=(1,),
                 device=self.device,
             ).item()
-            max_extra = self._MAX_TASK_CUBES - 1 - num_green
-            max_extra = max(0, min(max_extra, self._MAX_SCATTERED_CUBES))
-            re = self._episode_rng
-            if max_extra <= 0:
-                num_extra_scattered = 0
-            elif max_extra == 1:
-                num_extra_scattered = int(re.randint(0, 2))
-            else:
-                low = 2
-                num_extra_scattered = int(re.randint(low, max_extra + 1))
 
             # -------------------------------
             # 1) 待抓取方块 cubeA 的初始位置、姿态（桌面上，允许轻微 yaw 偏转）
@@ -337,13 +353,9 @@ class StackCubeEnv(BaseEnv):
             else:
                 base_xy = torch.rand((b, 2), device=self.device) * 0.8 - 0.4
             xyz[:, :2] = base_xy
-            # 绕 z 轴添加一个小角度偏转（例如 ±30°），使方块看起来“歪一点”
-            angle = (torch.rand(b, device=self.device) - 0.5) * (np.pi / 3.0)  # ±30°
-            qw = torch.cos(angle / 2.0)
-            qz = torch.sin(angle / 2.0)
+            # 统一方块朝向：全部与世界坐标轴对齐（无随机 yaw）。
             shared_qs = torch.zeros((b, 4), device=self.device)
-            shared_qs[:, 0] = qw
-            shared_qs[:, 3] = qz
+            shared_qs[:, 0] = 1.0
             self.cubeA.set_pose(Pose.create_from_pq(p=xyz.clone(), q=shared_qs))
 
             # -------------------------------
@@ -354,12 +366,13 @@ class StackCubeEnv(BaseEnv):
             #    - 目标 cubeB 可以位于任意一层的任意方块上（不再强制选最上层），
             #      这样待抓取块有时会放在最高层上方，有时会落在已有最高层之下。
             # -------------------------------
-            # 为整堆方块使用单位四元数，使所有块与桌面坐标轴完全对齐。
+            # 为整堆方块使用单位四元数（w=1），使所有块与桌面坐标轴完全对齐。
             green_q = torch.zeros((1, 4), device=self.device)
-            green_q[:, 3] = 1.0
+            green_q[:, 0] = 1.0
 
-            # 每一层使用 2x2 网格，间距刚好是一个方块直径，使方块“挤在一起”
-            spacing = float(self.cube_half_size[0] * 2.0)
+            # 每一层使用 2x2 网格，方块之间留约 1/5 边长缝隙。
+            cube_side = float(self.cube_half_size[0] * 2.0)
+            spacing = cube_side * 1.2
             offsets_xy = torch.tensor(
                 [
                     [-0.5 * spacing, -0.5 * spacing],
@@ -466,27 +479,34 @@ class StackCubeEnv(BaseEnv):
                 p=torch.tensor([[0.0, 0.0, -1.0]], device=self.device),
                 q=green_q,
             )
+            # “前方”定义为远离机械臂的一侧（x 更大的一侧），这里限制散落块只出现在 x <= 0 的半平面，
+            # 同时仍保持在线框外，形成“后/左/右”分布。
+            front_x_threshold = 0.0
             for i, cube in enumerate(self.extra_scattered_cubes):
                 if i < num_extra_scattered:
+                    valid_xy = None
                     for _ in range(64):
                         xy = (torch.rand(2, device=self.device) * 0.8 - 0.4).cpu().numpy()
                         dist_stack = np.linalg.norm(xy)
                         dist_cubeA = np.linalg.norm(xy - cubeA_xy_np)
                         outside_frame = abs(xy[0]) > frame_half or abs(xy[1]) > frame_half
+                        not_front = xy[0] <= front_x_threshold
                         if (
                             outside_frame
+                            and not_front
                             and dist_stack > min_dist_from_stack
                             and dist_cubeA > min_dist_from_cubeA
                         ):
+                            valid_xy = xy
                             break
+                    if valid_xy is None:
+                        # 兜底：若采样失败，放在线框后方近处，避免落到前方不可达区域。
+                        valid_xy = np.array([-frame_half - 0.03, 0.0], dtype=np.float32)
                     p = np.array(
-                        [xy[0], xy[1], float(self.cube_half_size[2])],
+                        [valid_xy[0], valid_xy[1], float(self.cube_half_size[2])],
                         dtype=np.float32,
                     )
-                    a = (np.random.rand() - 0.5) * (np.pi / 3.0)
-                    qw_r = np.cos(a / 2.0)
-                    qz_r = np.sin(a / 2.0)
-                    q = np.array([qw_r, 0.0, 0.0, qz_r], dtype=np.float32)
+                    q = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
                     pose = Pose.create_from_pq(
                         p=torch.tensor([p], device=self.device),
                         q=torch.tensor([q], device=self.device),
@@ -516,12 +536,7 @@ class StackCubeEnv(BaseEnv):
                     py = distractor_xy[i, 1]
                     pose = Pose.create_from_pq(
                         p=torch.tensor([[px, py, dz]], device=self.device),
-                        q=randomization.random_quaternions(
-                            1,
-                            lock_x=True,
-                            lock_y=True,
-                            lock_z=False,
-                        ),
+                        q=torch.tensor([[1.0, 0.0, 0.0, 0.0]], device=self.device),
                     )
                     actor.set_pose(pose)
 
