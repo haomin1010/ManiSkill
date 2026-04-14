@@ -1,7 +1,6 @@
 import argparse
 from pathlib import Path
 import json
-import shutil
 import warnings
 
 import numpy as np
@@ -193,7 +192,7 @@ def main():
     parser.add_argument(
         "--delete-collision-videos",
         action="store_true",
-        help="检测到碰撞时直接删除视频，而非移动到 collision/ 目录。",
+        help="兼容旧参数。当前脚本会在生成阶段直接丢弃失败轨迹，不再单独处理碰撞视频。",
     )
     parser.add_argument(
         "--balanced-preplaced-0to9",
@@ -201,12 +200,15 @@ def main():
         default=True,
         help="按 0~9 均匀分配额外已摆好方块数量（10*n 条时每档 n 条）。",
     )
+    parser.add_argument(
+        "--max-retries-per-episode",
+        type=int,
+        default=30,
+        help="每条目标样本最多重试次数（失败定义为碰撞或 solve 不成功）。",
+    )
     args = parser.parse_args()
 
     output_dir = Path("videos/StackCube-v1")
-    collision_dir = output_dir / "collision"
-    if not args.delete_collision_videos:
-        collision_dir.mkdir(parents=True, exist_ok=True)
     screenshot_dir = output_dir / "screenshots"
     screenshot_dir.mkdir(parents=True, exist_ok=True)
 
@@ -234,7 +236,7 @@ def main():
     )
 
     meta = {}
-    collision_episodes = []
+    discarded_attempts = 0
 
     # [DEBUG] 数据生成阶段：首次 reset 后打印相机列表（将写入 H5 的 sensor_data）
     _first_reset_done = False
@@ -245,16 +247,23 @@ def main():
             "仅在 10*n 时严格满足每档数量完全一致。"
         )
 
-    for ep in range(args.num_episodes):
+    saved_ep = 0
+    global_attempt = 0
+    retry_count_for_ep = 0
+    # 通过 reset(save=...) 控制“上一条”是否真正写入；失败样本在下一次 reset 时丢弃。
+    save_prev_episode = True
+
+    while saved_ep < args.num_episodes:
+        ep = saved_ep
         if args.base_seed is not None:
-            ep_seed = int(args.base_seed) + ep
+            ep_seed = int(args.base_seed) + global_attempt
         else:
             ep_seed = None
 
         reset_options = None
         if args.balanced_preplaced_0to9:
             reset_options = {"preplaced_count": int(ep % 10)}
-        obs, info = env.reset(seed=ep_seed, options=reset_options)
+        obs, info = env.reset(seed=ep_seed, options=reset_options, save=save_prev_episode)
 
         if not _first_reset_done:
             cams = [c for c in obs.get("sensor_data", {}) if "rgb" in obs["sensor_data"].get(c, {})]
@@ -288,24 +297,45 @@ def main():
         collision, displacements = check_collision(
             init_positions, final_positions, threshold=args.collision_threshold
         )
+        accepted = bool(res) and (not collision)
 
         print(
-            f"episode {ep}, seed={ep_seed}, home_steps={home_steps}, "
+            f"target_ep {ep}, attempt={global_attempt}, seed={ep_seed}, home_steps={home_steps}, "
             f"success={res}, collision={collision}, "
             f"preplaced_count={reset_options['preplaced_count'] if reset_options else 'random'}"
         )
         if collision:
-            collision_episodes.append(ep)
             print(f"  -> 碰撞检测：位移 = {displacements}")
-
-        meta[ep] = {
-            "seed": ep_seed,
-            "trim_head_steps": int(home_steps),
-            "success": bool(res),
-            "collision": collision,
-            "displacements": displacements,
-            "preplaced_count": int(reset_options["preplaced_count"]) if reset_options else None,
-        }
+        if accepted:
+            meta[ep] = {
+                "seed": ep_seed,
+                "trim_head_steps": int(home_steps),
+                "success": bool(res),
+                "collision": collision,
+                "displacements": displacements,
+                "preplaced_count": int(reset_options["preplaced_count"]) if reset_options else None,
+                "attempt": int(global_attempt),
+                "retry_count_for_episode": int(retry_count_for_ep),
+            }
+            save_prev_episode = True
+            retry_count_for_ep = 0
+            saved_ep += 1
+        else:
+            # 下一次 reset(save=False) 时丢弃本次失败轨迹及视频，保持最终编号连续且全为有效样本。
+            save_prev_episode = False
+            retry_count_for_ep += 1
+            discarded_attempts += 1
+            print(
+                f"  -> 本次样本将被丢弃并重试（retry {retry_count_for_ep}/{args.max_retries_per_episode}）"
+            )
+            if retry_count_for_ep > args.max_retries_per_episode:
+                # 先丢弃当前失败样本，再退出，避免 close() 时把失败条目写进数据集。
+                env.reset(save=False)
+                env.close()
+                raise RuntimeError(
+                    f"episode {ep} 连续失败超过上限（{args.max_retries_per_episode}），已中止。"
+                )
+        global_attempt += 1
 
     env.close()
 
@@ -314,41 +344,7 @@ def main():
     with meta_path.open("w") as f:
         json.dump(meta, f, indent=2)
 
-    # 处理碰撞 episode 的视频和截图
-    camera_names_for_screenshots = ["base_camera", "left_side_camera", "right_side_camera"]
-    if collision_episodes:
-        print(f"\n发生碰撞的 episode: {collision_episodes}")
-        # 删除碰撞 episode 的截图和框坐标
-        print("正在删除碰撞 episode 的截图和框坐标 ...")
-        for ep in collision_episodes:
-            for cam in camera_names_for_screenshots:
-                png_path = screenshot_dir / f"ep{ep}_{cam}.png"
-                if png_path.exists():
-                    png_path.unlink()
-                    print(f"  删除: {png_path.name}")
-            for fname in [f"ep{ep}_boxes.json", f"ep{ep}_boxes_with_corners.json"]:
-                fp = screenshot_dir / fname
-                if fp.exists():
-                    fp.unlink()
-                    print(f"  删除: {fp.name}")
-        # 处理视频
-        if args.delete_collision_videos:
-            print("正在删除碰撞视频 ...")
-            for ep in collision_episodes:
-                video_file = output_dir / f"{ep}.mp4"
-                if video_file.exists():
-                    video_file.unlink()
-                    print(f"  删除: {video_file.name}")
-        else:
-            print(f"正在将碰撞视频移动到 {collision_dir} ...")
-            for ep in collision_episodes:
-                video_file = output_dir / f"{ep}.mp4"
-                if video_file.exists():
-                    dest = collision_dir / f"{ep}.mp4"
-                    shutil.move(str(video_file), str(dest))
-                    print(f"  移动: {video_file.name} -> collision/")
-    else:
-        print("\n没有检测到碰撞的 episode。")
+    print(f"\n已保存有效样本: {args.num_episodes} 条；丢弃并重试次数: {discarded_attempts}")
 
     print(f"\n录制完成。meta 保存在: {meta_path}")
 
