@@ -192,37 +192,57 @@ def solve(env: StackCubeEnv, seed=None, debug=False, vis=False, do_reset=True, a
     # 左乘：在世界坐标系中绕 z 轴旋转
     place_q = quat_mul(q_rot, lift_q)
 
-    # 分两步：先移到目标正上方高处（pre-place），再垂直下放到目标位置（place）
-    # 这样可以避免在水平移动时碰到堆叠塔最上层的其它方块
+    # 改为“到目标上方直接松爪”：
+    # 先移动到目标 xy 上方的安全高度，不再下探接触，直接释放让方块自然下落，
+    # 以减少周围有方块时的碰撞风险。
 
-    # 1) pre-place：目标 xy 位置，但保持 lift 的高度，同时调整姿态
-    pre_place_p = np.array([goal_p[0], goal_p[1], lift_p[2]], dtype=np.float32)
+    # 用“方块中心位移补偿”消除抓取偏心导致的系统性落点偏差：
+    # 先读取当前 cubeA 中心与 TCP 的相对结果，不直接假设 TCP 对到 goal 就能让方块到 goal。
+    cubeA_p_now = _to_vec(env.cubeA.pose.p, 3).astype(np.float32)
+    desired_cube_center = goal_p.astype(np.float32)
+
+    # 目标上方的释放高度：约 1.2 个方块边长
+    release_height = float(env.cube_half_size[2] * 2.0 * 1.2)
+    desired_cube_center[2] = float(goal_p[2] + release_height)
+
+    # 若当前 cubeA 不是正好在 TCP 下方中心，按“cubeA 当前中心 -> 目标中心”的位移来移动 TCP。
+    # 这样能补偿抓取偏心、轻微滑移造成的恒定偏差。
+    delta_cube = desired_cube_center - cubeA_p_now
+    pre_place_p = (lift_p.astype(np.float32) + delta_cube).astype(np.float32)
     pre_place_pose = sapien.Pose(p=pre_place_p, q=place_q)
-    print("[solve] move to pre-place pose (above target, aligned)")
+    print("[solve] move to release pose (above target, aligned)")
     res_move = planner.move_to_pose_with_screw(pre_place_pose)
-    print(f"[solve] pre-place pose result={res_move}")
+    print(f"[solve] release pose result={res_move}")
     if res_move == -1:
-        print("[solve] fail to move to pre-place pose, abort episode")
+        print("[solve] fail to move to release pose, abort episode")
         planner.close()
         return False, home_steps
 
-    # 2) place：垂直下放到目标位置
-    place_p = goal_p.astype(np.float32)
-    place_pose = sapien.Pose(p=place_p, q=place_q)
-    print("[solve] move to place pose (final stack)")
-    res_move = planner.move_to_pose_with_screw(place_pose)
-    print(f"[solve] place pose result={res_move}")
-    if res_move == -1:
-        print("[solve] fail to move to place pose, abort episode")
-        planner.close()
-        return False, home_steps
+    # 在目标上方先短暂停顿几步，再松爪，减少末端还在微动时释放带来的偏差。
+    pause_steps = 6
+    qpos_hold = planner.robot.get_qpos()[0, : len(planner.planner.joint_vel_limits)].cpu().numpy()
+    for _ in range(pause_steps):
+        if planner.control_mode == "pd_joint_pos":
+            hold_action = np.hstack([qpos_hold, planner.CLOSED])
+        else:
+            hold_action = np.hstack([qpos_hold, qpos_hold * 0, planner.CLOSED])
+        env.step(hold_action)
+        planner.elapsed_steps += 1
 
     res = planner.open_gripper()
-    print(f"[solve] open gripper, result={res}")
+    print(f"[solve] open gripper above target, result={res}")
 
-    # 任务完成后将机械臂复位到同一个 home pose，避免遮挡最后若干帧的视野
-    # 结束时不再强制回 home，避免额外长轨迹；此处只打印一行标记结束。
-    print("[solve] end of task (no explicit home move)")
+    # -------------------------------------------------------------------------- #
+    # Reset：在成功放置并松爪之后，再次回到开头使用的简单 home pose
+    # 这样可以在数据中记录一个“复位”过程，方便训练包含复位段的策略 / 视觉先验。
+    # -------------------------------------------------------------------------- #
+    print("[solve] move back to simple home pose for reset (+0.3m)")
+    planner.elapsed_steps = 0
+    res_reset = planner.move_to_pose_with_screw(home_pose)
+    reset_steps = int(planner.elapsed_steps)
+    print(f"[solve] reset home pose result={res_reset}, reset_steps={reset_steps}")
+
+    print("[solve] end of task (with explicit reset home move)")
     planner.close()
     print("[solve] done")
     # 返回：任务是否成功 + home 段所占的步数（用于后处理时裁剪前缀）
