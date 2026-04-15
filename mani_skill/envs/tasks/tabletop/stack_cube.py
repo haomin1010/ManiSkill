@@ -34,7 +34,7 @@ class StackCubeEnv(BaseEnv):
     """
 
     # cubeA(1) + stack + scattered extras <= _MAX_TASK_CUBES
-    _MAX_TASK_CUBES = 11
+    _MAX_TASK_CUBES = 18
     # 当堆叠只有 1 块时，最多再摆 8 个散落块
     _MAX_SCATTERED_CUBES = 8
 
@@ -51,6 +51,14 @@ class StackCubeEnv(BaseEnv):
         [0.92, 0.35, 0.55],
         [0.25, 0.55, 0.35],
         [0.55, 0.38, 0.22],
+        [0.20, 0.62, 0.68],
+        [0.78, 0.28, 0.20],
+        [0.30, 0.78, 0.48],
+        [0.82, 0.62, 0.24],
+        [0.36, 0.42, 0.86],
+        [0.74, 0.24, 0.66],
+        [0.18, 0.82, 0.74],
+        [0.86, 0.52, 0.16],
     ]
 
     _sample_video_link = "https://github.com/haosulab/ManiSkill/raw/main/figures/environment_demos/StackCube-v1_rt.mp4"
@@ -299,7 +307,10 @@ class StackCubeEnv(BaseEnv):
                 # 只有超过堆叠上限时才分配到散落块。
                 stack_extra = min(extra_total, self.max_green_cubes - 1)
                 num_green = 1 + stack_extra
-                num_extra_scattered = extra_total - stack_extra
+                base_scattered = extra_total - stack_extra
+                # 在现有配置基础上，额外增加 3~7 个散落方块。
+                bonus_scattered = int(self._episode_rng.randint(3, 8))
+                num_extra_scattered = base_scattered + bonus_scattered
             else:
                 # 默认随机逻辑：采样堆叠规模与散落块数量，保证 cubeA + 堆叠 + 散落 <= _MAX_TASK_CUBES
                 num_green = torch.randint(
