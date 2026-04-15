@@ -76,7 +76,7 @@ class Args:
         "videos/StackCube-v1/stackcube_expert.rgbd.pd_ee_delta_pos.physx_cpu.h5"
     )
     """the path of demo dataset, it is expected to be a ManiSkill dataset h5py format file"""
-    num_demos: Optional[int] = 5
+    num_demos: Optional[int] = None
     """number of trajectories to load from the demo dataset"""
     total_iters: int = 500_000
     """total timesteps of the experiment"""
