@@ -219,6 +219,7 @@ def main():
         control_mode="pd_joint_pos",
         render_mode="rgb_array",
         close_camera=args.close_camera,
+        robot_uids="panda_wristcam",
     )
 
     env = RecordEpisode(
