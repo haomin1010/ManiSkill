@@ -7,7 +7,6 @@ import torch
 
 from mani_skill.agents.robots import Fetch, Panda
 from mani_skill.envs.sapien_env import BaseEnv
-from mani_skill.envs.utils import randomization
 from mani_skill.sensors.camera import CameraConfig
 from mani_skill.utils import common, sapien_utils
 from mani_skill.utils.building import actors
@@ -35,7 +34,7 @@ class StackCubeEnv(BaseEnv):
     """
 
     # cubeA(1) + stack + scattered extras <= _MAX_TASK_CUBES
-    _MAX_TASK_CUBES = 10
+    _MAX_TASK_CUBES = 18
     # 当堆叠只有 1 块时，最多再摆 8 个散落块
     _MAX_SCATTERED_CUBES = 8
 
@@ -52,6 +51,14 @@ class StackCubeEnv(BaseEnv):
         [0.92, 0.35, 0.55],
         [0.25, 0.55, 0.35],
         [0.55, 0.38, 0.22],
+        [0.20, 0.62, 0.68],
+        [0.78, 0.28, 0.20],
+        [0.30, 0.78, 0.48],
+        [0.82, 0.62, 0.24],
+        [0.36, 0.42, 0.86],
+        [0.74, 0.24, 0.66],
+        [0.18, 0.82, 0.74],
+        [0.86, 0.52, 0.16],
     ]
 
     _sample_video_link = "https://github.com/haosulab/ManiSkill/raw/main/figures/environment_demos/StackCube-v1_rt.mp4"
@@ -112,8 +119,9 @@ class StackCubeEnv(BaseEnv):
         self.table_scene.build()
         # 在桌面上画出一个固定的“作业范围”正方形（类似白色胶带圈出的区域）
         # 这里使用四条很细长的 box 作为边框，只添加可视几何体，不参与碰撞。
-        # 将范围缩小到刚好容纳 4x4 个方块的正方形区域，以堆叠方块中心为正中。
+        # 将范围设置为可容纳 4x4 个方块（含 1/5 边长缝隙）的正方形区域，以堆叠方块中心为正中。
         side = float(self.cube_half_size[0] * 8.0)  # 4 个方块直径 = 8 * half_size
+        side *= 1.15  # 4x4 且有缝隙时，需要比纯“贴合直径”更大的包围框
         workspace_half_x = side / 2.0
         workspace_half_y = side / 2.0
         line_thickness = 0.004
@@ -173,9 +181,9 @@ class StackCubeEnv(BaseEnv):
             initial_pose=sapien.Pose(p=[1, 0, 0.1]),
         )
 
-        # 额外的堆叠方块，用来组成 1~3 层、总数 1~8 个的“堆叠场景”
-        # 这里预先创建最多 7 个额外方块，实际每个 episode 中会根据采样需求启用其中一部分，其余放到桌子下方隐藏。
-        self.max_green_cubes = 8  # 包括 cubeB 在内的总数上限
+        # 额外的堆叠方块，用来组成 1~3 层、总数 1~9 个的“堆叠场景”
+        # 这里预先创建最多 8 个额外方块，实际每个 episode 中会根据采样需求启用其中一部分，其余放到桌子下方隐藏。
+        self.max_green_cubes = 9  # 包括 cubeB 在内的总数上限
         self.extra_green_cubes = []
         for i in range(self.max_green_cubes - 1):
             cube = actors.build_cube(
@@ -288,6 +296,49 @@ class StackCubeEnv(BaseEnv):
         with torch.device(self.device):
             b = len(env_idx)
             self.table_scene.initialize(env_idx)
+            options = options or {}
+
+            # 可选地由外部指定“额外已摆好方块数量”（不含 cubeA / cubeB），用于构造 0~9 的均匀分布数据。
+            forced_preplaced = options.get("preplaced_count", None)
+            if forced_preplaced is not None:
+                extra_total = int(forced_preplaced)
+                extra_total = max(0, min(9, extra_total))
+                # 对于“已摆好数量”强约束，优先把数量放到堆叠塔中（更直观、也更符合你的数据控制目标）；
+                # 只有超过堆叠上限时才分配到散落块。
+                stack_extra = min(extra_total, self.max_green_cubes - 1)
+                num_green = 1 + stack_extra
+                base_scattered = extra_total - stack_extra
+                # 在现有配置基础上，额外增加 3~7 个散落方块。
+                bonus_scattered = int(self._episode_rng.randint(3, 8))
+                num_extra_scattered = base_scattered + bonus_scattered
+            else:
+                # 默认随机逻辑：采样堆叠规模与散落块数量，保证 cubeA + 堆叠 + 散落 <= _MAX_TASK_CUBES
+                num_green = torch.randint(
+                    low=1,
+                    high=self.max_green_cubes + 1,
+                    size=(1,),
+                    device=self.device,
+                ).item()
+                max_extra = self._MAX_TASK_CUBES - 1 - num_green
+                max_extra = max(0, min(max_extra, self._MAX_SCATTERED_CUBES))
+                re = self._episode_rng
+                if max_extra <= 0:
+                    num_extra_scattered = 0
+                elif max_extra == 1:
+                    num_extra_scattered = int(re.randint(0, 2))
+                else:
+                    low = 2
+                    num_extra_scattered = int(re.randint(low, max_extra + 1))
+
+            max_layers = min(3, num_green)
+            # 每层最多 4 个，为保证能容纳 num_green，层数下限为 ceil(num_green / 4)
+            min_layers = max(1, int(np.ceil(num_green / 4.0)))
+            num_layers = torch.randint(
+                low=min_layers,
+                high=max_layers + 1,
+                size=(1,),
+                device=self.device,
+            ).item()
 
             # 先采样堆叠规模与散落块数量，保证 cubeA + 堆叠 + 散落 <= _MAX_TASK_CUBES
             num_green = torch.randint(
@@ -322,115 +373,217 @@ class StackCubeEnv(BaseEnv):
             # 将 cubeA 放置在 4x4 线框“外侧但不太远”的环形区域内，
             # 避免一开始就挤在堆叠塔附近，同时又不会离任务区太远。
             # 线框半边长与 _load_scene 中保持一致。
-            side = float(self.cube_half_size[0] * 8.0)
+            side = float(self.cube_half_size[0] * 8.0) * 1.15
             frame_half = side / 2.0
             max_dist = float(self.cube_half_size[0] * 10.0)  # 上界，约 5 个方块直径
+            # 与散落块一致：限制待操作方块不要出现在“前方（远离机械臂）”区域。
+            front_x_threshold = 0.0
             for _ in range(64):
                 candidate_xy = torch.rand((b, 2), device=self.device) * 0.8 - 0.4  # [-0.4,0.4]
                 # 只检查第 0 个 env（当前假设单 env）
                 c0 = candidate_xy[0]
                 # r 必须落在 (frame_half, max_dist) 之间，既在线框外，又不太远
                 r = torch.linalg.norm(c0)
-                if (torch.any(torch.abs(c0) > frame_half)) and (r < max_dist):
+                not_front = c0[0] <= front_x_threshold
+                if (torch.any(torch.abs(c0) > frame_half)) and (r < max_dist) and not_front:
                     base_xy = candidate_xy
                     break
             else:
-                base_xy = torch.rand((b, 2), device=self.device) * 0.8 - 0.4
+                # 兜底也保持不在前方，避免采样失败时放宽约束。
+                fallback = torch.rand((b, 2), device=self.device) * 0.8 - 0.4
+                fallback[:, 0] = torch.clamp(fallback[:, 0], max=front_x_threshold - 1e-3)
+                base_xy = fallback
             xyz[:, :2] = base_xy
-            # 绕 z 轴添加一个小角度偏转（例如 ±30°），使方块看起来“歪一点”
-            angle = (torch.rand(b, device=self.device) - 0.5) * (np.pi / 3.0)  # ±30°
-            qw = torch.cos(angle / 2.0)
-            qz = torch.sin(angle / 2.0)
+            # 统一方块朝向：全部与世界坐标轴对齐（无随机 yaw）。
             shared_qs = torch.zeros((b, 4), device=self.device)
-            shared_qs[:, 0] = qw
-            shared_qs[:, 3] = qz
+            shared_qs[:, 0] = 1.0
             self.cubeA.set_pose(Pose.create_from_pq(p=xyz.clone(), q=shared_qs))
 
             # -------------------------------
-            # 2) 堆叠塔（cubeB + extra_green_cubes）：总数 1~8 个，1~3 层，姿态对齐且规则栈叠
+            # 2) 堆叠塔（cubeB + extra_green_cubes）：总数 1~9 个，1~3 层，姿态对齐且规则栈叠
             #    - 堆叠块共享同一个 yaw，整齐对齐
-            #    - 采用 2x2 的网格，每一层最多 4 个方块，最多 3 层
+            #    - 采用 4x4 的网格，最多 3 层；第一层最多 6 个方块
             #    - 物理约束：如果第 n+1 层某位置有方块，则第 n 层同位置必须也有方块（不允许“悬空”）
-            #    - 目标 cubeB 可以位于任意一层的任意方块上（不再强制选最上层），
-            #      这样待抓取块有时会放在最高层上方，有时会落在已有最高层之下。
+            #    - 每层都采样为连通块，避免同层出现彼此分散的孤岛。
             # -------------------------------
-            # 为整堆方块使用单位四元数，使所有块与桌面坐标轴完全对齐。
+            # 为整堆方块使用单位四元数（w=1），使所有块与桌面坐标轴完全对齐。
             green_q = torch.zeros((1, 4), device=self.device)
-            green_q[:, 3] = 1.0
+            green_q[:, 0] = 1.0
 
-            # 每一层使用 2x2 网格，间距刚好是一个方块直径，使方块“挤在一起”
-            spacing = float(self.cube_half_size[0] * 2.0)
-            offsets_xy = torch.tensor(
-                [
-                    [-0.5 * spacing, -0.5 * spacing],
-                    [0.5 * spacing, -0.5 * spacing],
-                    [-0.5 * spacing, 0.5 * spacing],
-                    [0.5 * spacing, 0.5 * spacing],
-                ],
-                device=self.device,
-            )  # (4,2)
+            # 每一层使用 4x4 网格，方块之间留约 1/5 边长缝隙。
+            cube_side = float(self.cube_half_size[0] * 2.0)
+            spacing = cube_side * 1.2
+            grid_size = 4
+            grid_coords = np.arange(grid_size, dtype=np.float32) - (grid_size - 1) / 2.0
+            offsets_xy = []
+            for r in range(grid_size):
+                for c in range(grid_size):
+                    offsets_xy.append([grid_coords[r] * spacing, grid_coords[c] * spacing])
+            offsets_xy = torch.tensor(offsets_xy, device=self.device, dtype=torch.float32)  # (16,2)
+            layer_capacity = offsets_xy.shape[0]
+            first_layer_max = 6
 
             # 整堆绿块的中心位置：固定在原点 (0, 0)，对应白色 4x4 作业框的正中心
             stack_center_xy = torch.zeros((1, 2), device=self.device)
 
-            # 构造满足“上层必须有下层支撑”的槽位集合。
-            # 先为第 0 层采样若干位置，再逐层向上，在每一层选择一部分下层已占用的位置继续堆叠。
+            def _cell_rc(cell_id: int):
+                return (cell_id // grid_size, cell_id % grid_size)
+
+            def _cell_id(r: int, c: int):
+                return r * grid_size + c
+
+            def _neighbors4(cell_id: int):
+                r, c = _cell_rc(cell_id)
+                out = []
+                if r > 0:
+                    out.append(_cell_id(r - 1, c))
+                if r < grid_size - 1:
+                    out.append(_cell_id(r + 1, c))
+                if c > 0:
+                    out.append(_cell_id(r, c - 1))
+                if c < grid_size - 1:
+                    out.append(_cell_id(r, c + 1))
+                return out
+
+            def _sample_connected_cells(allowed_cells: set[int], k: int):
+                """在 allowed_cells 中采样 k 个 4-连通格子。"""
+                allowed_list = sorted(list(allowed_cells))
+                if k <= 0 or len(allowed_list) == 0:
+                    return set()
+                if k == 1:
+                    idx = int(torch.randint(low=0, high=len(allowed_list), size=(1,), device=self.device).item())
+                    return {allowed_list[idx]}
+                # 尝试多次采样，尽量保证连通
+                for _ in range(80):
+                    seed_idx = int(torch.randint(low=0, high=len(allowed_list), size=(1,), device=self.device).item())
+                    chosen = {allowed_list[seed_idx]}
+                    while len(chosen) < k:
+                        frontier = []
+                        for c in chosen:
+                            for nb in _neighbors4(c):
+                                if nb in allowed_cells and nb not in chosen:
+                                    frontier.append(nb)
+                        if len(frontier) == 0:
+                            break
+                        pick = int(torch.randint(low=0, high=len(frontier), size=(1,), device=self.device).item())
+                        chosen.add(frontier[pick])
+                    if len(chosen) == k:
+                        return chosen
+                # 兜底：若连通采样失败，返回任意 k 个（极少发生）
+                perm = torch.randperm(len(allowed_list), device=self.device)
+                return set(allowed_list[int(i)] for i in perm[:k].tolist())
+
+            # 重新采样层数，确保与“第一层最多 6 个”约束一致
+            max_layers = min(3, num_green)
+            min_layers = max(1, int(np.ceil(num_green / float(first_layer_max))))
+            num_layers = int(
+                torch.randint(low=min_layers, high=max_layers + 1, size=(1,), device=self.device).item()
+            )
+
+            # 先采样每层数量（每层非空、上层不超过下层；第 1 层最多 6）
+            remaining = int(num_green)
+            layer_counts = []
+            for layer_idx in range(num_layers):
+                layers_left = num_layers - layer_idx
+                min_here = max(1, int(np.ceil(remaining / float(layers_left))))
+                if layer_idx == 0:
+                    max_here = min(first_layer_max, layer_capacity, remaining - (layers_left - 1))
+                else:
+                    max_here = min(layer_counts[-1], remaining - (layers_left - 1))
+                if min_here > max_here:
+                    min_here = max_here
+                count = int(
+                    torch.randint(low=min_here, high=max_here + 1, size=(1,), device=self.device).item()
+                )
+                layer_counts.append(count)
+                remaining -= count
+
+            # 根据每层数量采样具体格子：每层连通，上层仅能在下层同格位置中选（保证支撑）
+            layer_cells = []
+            for layer_idx, count in enumerate(layer_counts):
+                if layer_idx == 0:
+                    allowed = set(range(layer_capacity))
+                else:
+                    allowed = set(layer_cells[layer_idx - 1])
+                cells = _sample_connected_cells(allowed, count)
+                layer_cells.append(cells)
+
             chosen_slots = []
-            remaining = num_green
+            for layer_idx, cells in enumerate(layer_cells):
+                for cell in sorted(list(cells)):
+                    chosen_slots.append((layer_idx, int(cell)))
 
-            # 第 0 层：至少 1 个，至多 4 个，同时预留出每一层至少 1 个的空间
-            max_base = min(4, remaining - (num_layers - 1))
-            base_count = torch.randint(
-                low=1,
-                high=max_base + 1,
-                size=(1,),
-                device=self.device,
-            ).item()
-            perm0 = torch.randperm(offsets_xy.shape[0], device=self.device)
-            base_positions = [offsets_xy[i] for i in perm0[:base_count]]
-            for pos in base_positions:
-                chosen_slots.append((0, pos))
-            remaining -= base_count
-
-            prev_layer_positions = base_positions
-            # 后续各层：只能在下层已有的位置上继续堆叠
-            for layer_idx in range(1, num_layers):
-                if remaining <= 0:
-                    break
-                max_here = min(len(prev_layer_positions), remaining - (num_layers - 1 - layer_idx))
-                if max_here <= 0:
-                    break
-                layer_count = torch.randint(
-                    low=1,
-                    high=max_here + 1,
-                    size=(1,),
-                    device=self.device,
-                ).item()
-                perm_l = torch.randperm(len(prev_layer_positions), device=self.device)
-                cur_positions = [prev_layer_positions[i] for i in perm_l[:layer_count]]
-                for pos in cur_positions:
-                    chosen_slots.append((layer_idx, pos))
-                remaining -= layer_count
-                prev_layer_positions = cur_positions
-
-            # 若还有剩余方块（未分配），统一放在第 0 层的剩余网格位置上
-            if remaining > 0:
-                used_base = set(tuple(p.cpu().tolist()) for p in base_positions)
-                extra_base_positions = [p for p in offsets_xy if tuple(p.cpu().tolist()) not in used_base]
-                if extra_base_positions:
-                    perm_extra = torch.randperm(len(extra_base_positions), device=self.device)
-                    for idx in perm_extra[:remaining]:
-                        chosen_slots.append((0, extra_base_positions[int(idx)]))
-
-            # 从“最高一层”的槽位中随机选一个作为 cubeB 的位置，
-            # 这样红块要么单独成为新的最上层一层，要么与该最高层的其他块处于同一高度。
+            # 选择 cubeB 的目标槽位：
+            # 1) 放置后目标层只能是 n 或 n+1（n 为当前最高层数）
+            #    - n 层：选择 top-1 层中“上方为空”的槽位（补当前最高层空位）
+            #    - n+1 层：选择 top 层槽位（单独新起一层）
+            # 2) 优先“补最高层空位且周围三格都已有方块”的场景，增加目标周边拥挤程度。
             top_layer = max(s[0] for s in chosen_slots)
-            top_slots = [s for s in chosen_slots if s[0] == top_layer]
-            perm_top = torch.randperm(len(top_slots), device=self.device)
-            target_slot = top_slots[int(perm_top[0])]
+
+            def _xy_key(cell_id: int):
+                r, c = _cell_rc(cell_id)
+                return (int(r), int(c))
+
+            occupied = set((layer, _xy_key(cell)) for layer, cell in chosen_slots)
+            fill_top_candidates = []  # cubeB 在 top-1，放置后到 top 层（即 n 层）
+            for layer, cell in chosen_slots:
+                if layer != top_layer - 1:
+                    continue
+                above_key = (layer + 1, _xy_key(cell))
+                if above_key not in occupied:
+                    fill_top_candidates.append((layer, cell))
+
+            top_slots = [s for s in chosen_slots if s[0] == top_layer]  # cubeB 在 top，放置后到 n+1 层
+
+            crowded_fill_candidates = []
+            if len(fill_top_candidates) > 0:
+                # 在 4x4 网格中优先选择“L 型三邻居”场景：
+                # 目标格周围满足两条正交边 + 一个角落邻居已占用。
+                top_xy_keys = set(_xy_key(cell) for layer, cell in chosen_slots if layer == top_layer)
+                for slot in fill_top_candidates:
+                    _, cell = slot
+                    r, c = _cell_rc(cell)
+                    l_patterns = [
+                        [(r - 1, c), (r, c - 1), (r - 1, c - 1)],
+                        [(r - 1, c), (r, c + 1), (r - 1, c + 1)],
+                        [(r + 1, c), (r, c - 1), (r + 1, c - 1)],
+                        [(r + 1, c), (r, c + 1), (r + 1, c + 1)],
+                    ]
+                    ok = False
+                    for pattern in l_patterns:
+                        valid = True
+                        for rr, cc in pattern:
+                            if rr < 0 or rr >= grid_size or cc < 0 or cc >= grid_size:
+                                valid = False
+                                break
+                            if (rr, cc) not in top_xy_keys:
+                                valid = False
+                                break
+                        if valid:
+                            ok = True
+                            break
+                    if ok:
+                        crowded_fill_candidates.append(slot)
+
+            if len(crowded_fill_candidates) > 0:
+                perm = torch.randperm(len(crowded_fill_candidates), device=self.device)
+                target_slot = crowded_fill_candidates[int(perm[0])]
+            elif len(fill_top_candidates) > 0:
+                perm = torch.randperm(len(fill_top_candidates), device=self.device)
+                target_slot = fill_top_candidates[int(perm[0])]
+            elif len(top_slots) > 0:
+                perm = torch.randperm(len(top_slots), device=self.device)
+                target_slot = top_slots[int(perm[0])]
+            else:
+                # 兜底：极端情况下至少选一个已有槽位
+                target_slot = chosen_slots[0]
 
             # 其余槽位（包含同层和更低层）用于额外方块
-            green_slots = [target_slot] + [s for s in chosen_slots if s is not target_slot]
+            target_key = (target_slot[0], _xy_key(target_slot[1]))
+            green_slots = [target_slot] + [
+                s for s in chosen_slots
+                if (s[0], _xy_key(s[1])) != target_key
+            ]
 
             # 把不需要的额外绿块先放到桌子下面“隐藏”
             hide_pose = Pose.create_from_pq(
@@ -441,20 +594,69 @@ class StackCubeEnv(BaseEnv):
                 cube.set_pose(hide_pose)
 
             # 绿色方块高度：底层放在 z = cube_half_size[2]，每层在此基础上叠加 2 * half_size
-            def _slot_to_pose(layer_idx: int, offset_xy: torch.Tensor) -> Pose:
+            def _slot_to_pose(layer_idx: int, cell_id: int) -> Pose:
+                offset_xy = offsets_xy[cell_id]
                 xy = stack_center_xy + offset_xy[None, :]
                 z = self.cube_half_size[2] + layer_idx * self.cube_half_size[2] * 2.0
                 p = torch.cat([xy, torch.full((1, 1), z, device=self.device)], dim=1)
                 return Pose.create_from_pq(p=p, q=green_q)
 
             # 第一个槽位对应 cubeB（目标所在那一块）
-            b_layer, b_offset = green_slots[0]
-            self.cubeB.set_pose(_slot_to_pose(b_layer, b_offset))
+            b_layer, b_cell = green_slots[0]
+            self.cubeB.set_pose(_slot_to_pose(b_layer, b_cell))
 
             # 其余槽位分配给 extra_green_cubes
             for slot, cube in zip(green_slots[1:], self.extra_green_cubes):
-                layer_idx, offset = slot
-                cube.set_pose(_slot_to_pose(layer_idx, offset))
+                layer_idx, cell_id = slot
+                cube.set_pose(_slot_to_pose(layer_idx, cell_id))
+
+            # -------------------------------
+            # 2b) 散落额外方块（随机数量；线框外，与堆叠塔和 cubeA 拉开距离）
+            # -------------------------------
+            min_dist_from_stack = float(self.cube_half_size[0] * 6.0)
+            min_dist_from_cubeA = float(self.cube_half_size[0] * 4.0)
+            cubeA_xy_np = base_xy[0].cpu().numpy()
+            hide_sc = Pose.create_from_pq(
+                p=torch.tensor([[0.0, 0.0, -1.0]], device=self.device),
+                q=green_q,
+            )
+            # “前方”定义为远离机械臂的一侧（x 更大的一侧），这里限制散落块只出现在 x <= 0 的半平面，
+            # 同时仍保持在线框外，形成“后/左/右”分布。
+            front_x_threshold = 0.0
+            for i, cube in enumerate(self.extra_scattered_cubes):
+                if i < num_extra_scattered:
+                    valid_xy = None
+                    for _ in range(64):
+                        xy = (torch.rand(2, device=self.device) * 0.8 - 0.4).cpu().numpy()
+                        dist_stack = np.linalg.norm(xy)
+                        dist_cubeA = np.linalg.norm(xy - cubeA_xy_np)
+                        outside_frame = abs(xy[0]) > frame_half or abs(xy[1]) > frame_half
+                        not_front = xy[0] <= front_x_threshold
+                        if (
+                            outside_frame
+                            and not_front
+                            and dist_stack > min_dist_from_stack
+                            and dist_cubeA > min_dist_from_cubeA
+                        ):
+                            valid_xy = xy
+                            break
+                    if valid_xy is None:
+                        # 兜底：若采样失败，放在线框后方近处，避免落到前方不可达区域。
+                        valid_xy = np.array([-frame_half - 0.03, 0.0], dtype=np.float32)
+                    p = np.array(
+                        [valid_xy[0], valid_xy[1], float(self.cube_half_size[2])],
+                        dtype=np.float32,
+                    )
+                    q = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+                    pose = Pose.create_from_pq(
+                        p=torch.tensor([p], device=self.device),
+                        q=torch.tensor([q], device=self.device),
+                    )
+                    cube.set_pose(pose)
+                else:
+                    cube.set_pose(hide_sc)
+
+            self._apply_episode_task_colors(num_green, num_extra_scattered)
 
             # -------------------------------
             # 2b) 散落额外方块（随机数量；线框外，与堆叠塔和 cubeA 拉开距离）
@@ -516,12 +718,7 @@ class StackCubeEnv(BaseEnv):
                     py = distractor_xy[i, 1]
                     pose = Pose.create_from_pq(
                         p=torch.tensor([[px, py, dz]], device=self.device),
-                        q=randomization.random_quaternions(
-                            1,
-                            lock_x=True,
-                            lock_y=True,
-                            lock_z=False,
-                        ),
+                        q=torch.tensor([[1.0, 0.0, 0.0, 0.0]], device=self.device),
                     )
                     actor.set_pose(pose)
 
