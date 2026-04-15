@@ -37,6 +37,7 @@ imgui.ini
 /videos
 /videos_new
 /videos_rgbd
+videos*/
 /examples/benchmarking/videos
 
 # benchmarking
