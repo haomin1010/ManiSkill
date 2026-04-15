@@ -9,24 +9,15 @@ python save_record.py --num-episodes 200 --base-seed 42 --delete-collision-video
 # 输出文件：videos/StackCube-v1/stackcube_expert.rgbd.pd_ee_delta_pose.physx_cpu.h5
 python -m mani_skill.trajectory.replay_trajectory \
   --traj-path videos/StackCube-v1/stackcube_expert.h5 \
-<<<<<<< HEAD
-  --use-first-env-state -c pd_ee_delta_pose -o rgbd \
-=======
   --use-first-env-state -c pd_ee_delta_pos -o rgbd \
->>>>>>> dataset_update
   --save-traj --num-envs 10 -b physx_cpu \
   --allow-failure --skip-collision
 
 # Step 3: 生成带框截图（screenshots/）及可选的 boxed 视频
 # --skip-collision: 跳过碰撞 episode
 python tools/vis_stackcube_boxes.py \
-<<<<<<< HEAD
-  --traj videos/StackCube-v1/stackcube_expert.rgbd.pd_ee_delta_pose.physx_cpu.h5 \
-  --meta videos/StackCube-v1/stackcube_expert.rgbd.pd_ee_delta_pose.physx_cpu.json \
-=======
   --traj videos/StackCube-v1/stackcube_expert.rgbd.pd_ee_delta_pos.physx_cpu.h5 \
   --meta videos/StackCube-v1/stackcube_expert.rgbd.pd_ee_delta_pos.physx_cpu.json \
->>>>>>> dataset_update
   --output-dir videos/StackCube-v1/boxed \
   --box-size 25 \
   --cameras base_camera,left_side_camera,right_side_camera \

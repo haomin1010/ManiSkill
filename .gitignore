@@ -35,11 +35,6 @@ imgui.ini
 /data
 /demos
 /videos
-<<<<<<< HEAD
-/videos_new
-/videos_rgbd
-=======
->>>>>>> dataset_update
 videos*/
 /examples/benchmarking/videos
 

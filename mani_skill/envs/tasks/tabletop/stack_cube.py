@@ -34,11 +34,7 @@ class StackCubeEnv(BaseEnv):
     """
 
     # cubeA(1) + stack + scattered extras <= _MAX_TASK_CUBES
-<<<<<<< HEAD
-    _MAX_TASK_CUBES = 10
-=======
     _MAX_TASK_CUBES = 11
->>>>>>> dataset_update
     # 当堆叠只有 1 块时，最多再摆 8 个散落块
     _MAX_SCATTERED_CUBES = 8
 
@@ -393,16 +389,6 @@ class StackCubeEnv(BaseEnv):
             self.cubeA.set_pose(Pose.create_from_pq(p=xyz.clone(), q=shared_qs))
 
             # -------------------------------
-<<<<<<< HEAD
-            # 2) 堆叠塔（cubeB + extra_green_cubes）：总数 1~8 个，1~3 层，姿态对齐且规则栈叠
-            #    - 堆叠块共享同一个 yaw，整齐对齐
-            #    - 采用 2x2 的网格，每一层最多 4 个方块，最多 3 层
-            #    - 物理约束：如果第 n+1 层某位置有方块，则第 n 层同位置必须也有方块（不允许“悬空”）
-            #    - 目标 cubeB 可以位于任意一层的任意方块上（不再强制选最上层），
-            #      这样待抓取块有时会放在最高层上方，有时会落在已有最高层之下。
-            # -------------------------------
-            # 为整堆方块使用单位四元数，使所有块与桌面坐标轴完全对齐。
-=======
             # 2) 堆叠塔（cubeB + extra_green_cubes）：总数 1~9 个，1~3 层，姿态对齐且规则栈叠
             #    - 堆叠块共享同一个 yaw，整齐对齐
             #    - 采用 4x4 的网格，最多 3 层；第一层最多 6 个方块
@@ -410,7 +396,6 @@ class StackCubeEnv(BaseEnv):
             #    - 每层都采样为连通块，避免同层出现彼此分散的孤岛。
             # -------------------------------
             # 为整堆方块使用单位四元数（w=1），使所有块与桌面坐标轴完全对齐。
->>>>>>> dataset_update
             green_q = torch.zeros((1, 4), device=self.device)
             green_q[:, 0] = 1.0
 
