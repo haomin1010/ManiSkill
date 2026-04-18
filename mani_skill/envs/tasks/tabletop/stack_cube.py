@@ -68,7 +68,7 @@ class StackCubeEnv(BaseEnv):
     def __init__(
         self,
         *args,
-        robot_uids="panda",
+        robot_uids="panda_wristcam",
         robot_init_qpos_noise=0.02,
         num_distractor_cubes: int = 0,
         close_camera: bool = False,
@@ -339,31 +339,6 @@ class StackCubeEnv(BaseEnv):
                 size=(1,),
                 device=self.device,
             ).item()
-
-            # 先采样堆叠规模与散落块数量，保证 cubeA + 堆叠 + 散落 <= _MAX_TASK_CUBES
-            num_green = torch.randint(
-                low=1,
-                high=self.max_green_cubes + 1,
-                size=(1,),
-                device=self.device,
-            ).item()
-            max_layers = min(3, num_green)
-            num_layers = torch.randint(
-                low=1,
-                high=max_layers + 1,
-                size=(1,),
-                device=self.device,
-            ).item()
-            max_extra = self._MAX_TASK_CUBES - 1 - num_green
-            max_extra = max(0, min(max_extra, self._MAX_SCATTERED_CUBES))
-            re = self._episode_rng
-            if max_extra <= 0:
-                num_extra_scattered = 0
-            elif max_extra == 1:
-                num_extra_scattered = int(re.randint(0, 2))
-            else:
-                low = 2
-                num_extra_scattered = int(re.randint(low, max_extra + 1))
 
             # -------------------------------
             # 1) 待抓取方块 cubeA 的初始位置、姿态（桌面上，允许轻微 yaw 偏转）
@@ -648,47 +623,6 @@ class StackCubeEnv(BaseEnv):
                         dtype=np.float32,
                     )
                     q = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
-                    pose = Pose.create_from_pq(
-                        p=torch.tensor([p], device=self.device),
-                        q=torch.tensor([q], device=self.device),
-                    )
-                    cube.set_pose(pose)
-                else:
-                    cube.set_pose(hide_sc)
-
-            self._apply_episode_task_colors(num_green, num_extra_scattered)
-
-            # -------------------------------
-            # 2b) 散落额外方块（随机数量；线框外，与堆叠塔和 cubeA 拉开距离）
-            # -------------------------------
-            min_dist_from_stack = float(self.cube_half_size[0] * 6.0)
-            min_dist_from_cubeA = float(self.cube_half_size[0] * 4.0)
-            cubeA_xy_np = base_xy[0].cpu().numpy()
-            hide_sc = Pose.create_from_pq(
-                p=torch.tensor([[0.0, 0.0, -1.0]], device=self.device),
-                q=green_q,
-            )
-            for i, cube in enumerate(self.extra_scattered_cubes):
-                if i < num_extra_scattered:
-                    for _ in range(64):
-                        xy = (torch.rand(2, device=self.device) * 0.8 - 0.4).cpu().numpy()
-                        dist_stack = np.linalg.norm(xy)
-                        dist_cubeA = np.linalg.norm(xy - cubeA_xy_np)
-                        outside_frame = abs(xy[0]) > frame_half or abs(xy[1]) > frame_half
-                        if (
-                            outside_frame
-                            and dist_stack > min_dist_from_stack
-                            and dist_cubeA > min_dist_from_cubeA
-                        ):
-                            break
-                    p = np.array(
-                        [xy[0], xy[1], float(self.cube_half_size[2])],
-                        dtype=np.float32,
-                    )
-                    a = (np.random.rand() - 0.5) * (np.pi / 3.0)
-                    qw_r = np.cos(a / 2.0)
-                    qz_r = np.sin(a / 2.0)
-                    q = np.array([qw_r, 0.0, 0.0, qz_r], dtype=np.float32)
                     pose = Pose.create_from_pq(
                         p=torch.tensor([p], device=self.device),
                         q=torch.tensor([q], device=self.device),
