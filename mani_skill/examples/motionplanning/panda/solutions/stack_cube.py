@@ -12,7 +12,15 @@ from mani_skill.examples.motionplanning.base_motionplanner.utils import (
     compute_grasp_info_by_obb, get_actor_obb)
 from mani_skill.utils.wrappers.record import RecordEpisode
 
-def solve(env: StackCubeEnv, seed=None, debug=False, vis=False, do_reset=True, after_home_callback=None):
+def solve(
+    env: StackCubeEnv,
+    seed=None,
+    debug=False,
+    vis=False,
+    do_reset=True,
+    after_home_callback=None,
+    post_task_reset: bool = False,
+):
     """
     执行堆叠任务的 motion planning。
     
@@ -21,6 +29,8 @@ def solve(env: StackCubeEnv, seed=None, debug=False, vis=False, do_reset=True, a
                   如果外部已经 reset 过，设为 False 避免重复 reset。
         after_home_callback: 可选的回调函数，在机械臂抬高（home pose）完成后调用。
                              用于在机械臂不遮挡视野时截图。
+        post_task_reset: 是否在松爪后再执行一次回到 home pose 的复位动作。
+                         默认 False，避免把复位段写入演示数据。
     """
     print(f"[solve] start, seed={seed}, do_reset={do_reset}")
     if do_reset:
@@ -232,17 +242,17 @@ def solve(env: StackCubeEnv, seed=None, debug=False, vis=False, do_reset=True, a
     res = planner.open_gripper()
     print(f"[solve] open gripper above target, result={res}")
 
-    # -------------------------------------------------------------------------- #
-    # Reset：在成功放置并松爪之后，再次回到开头使用的简单 home pose
-    # 这样可以在数据中记录一个“复位”过程，方便训练包含复位段的策略 / 视觉先验。
-    # -------------------------------------------------------------------------- #
-    print("[solve] move back to simple home pose for reset (+0.3m)")
-    planner.elapsed_steps = 0
-    res_reset = planner.move_to_pose_with_screw(home_pose)
-    reset_steps = int(planner.elapsed_steps)
-    print(f"[solve] reset home pose result={res_reset}, reset_steps={reset_steps}")
-
-    print("[solve] end of task (with explicit reset home move)")
+    if post_task_reset:
+        # Optional reset phase kept for debugging/evaluation use only.
+        # Do NOT enable during demo generation; it pollutes behavior cloning targets.
+        print("[solve] move back to simple home pose for reset (+0.3m)")
+        planner.elapsed_steps = 0
+        res_reset = planner.move_to_pose_with_screw(home_pose)
+        reset_steps = int(planner.elapsed_steps)
+        print(f"[solve] reset home pose result={res_reset}, reset_steps={reset_steps}")
+        print("[solve] end of task (with explicit reset home move)")
+    else:
+        print("[solve] end of task (no explicit post-task reset move)")
     planner.close()
     print("[solve] done")
     # 返回：任务是否成功 + home 段所占的步数（用于后处理时裁剪前缀）
